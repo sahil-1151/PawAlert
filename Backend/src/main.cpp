@@ -1,7 +1,33 @@
 #include "crow.h"
+#include <pqxx/pqxx>
 
 int main(){
-    crow::SimpleApp app;                          //this will create our server obj.
+    crow::SimpleApp app;  //this will create our server obj.
+
+    CROW_ROUTE(app,"/db-test")([](){ // command is used to connect the db to the crow 
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER"))); // create a connection with database with dbname = pawalert ,
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec("SELECT area_name FROM area WHERE area_id = 1");
+            txn.commit();
+
+            std::string area_name = r[0][0].c_str();
+
+            crow::json::wvalue response;
+            response["connected"] = true;
+            response["area_name"] = area_name;
+            return crow::response(200, response);
+        }
+        catch (const std::exception& e) {
+            crow::json::wvalue error;
+            error["connected"] = false;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
+
     CROW_ROUTE(app, "/")([](){                   //whenver some send get request "\" this function will gonna work.
         return "PawAlert server is running";
     });
