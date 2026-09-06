@@ -615,7 +615,171 @@ int main(){
         return crow::response(500, error);
         }
     });
+
+    CROW_ROUTE(app,"/case_status_history")([](){    //get request for case_status_history.
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result r = txn.exec(
+                "SELECT history_id,case_id,status,change_at FROM case_status_history"
+            );
+            crow::json::wvalue response;
+            int i=0;
+            for(auto row : r){
+                response[i]["history_id"] = row["history_id"].as<int>();
+                response[i]["case_id"] = row["case_id"].as<int>();
+                response[i]["status"] = row["status"].c_str();
+                response[i]["change_at"] = row["change_at"].c_str();
+                i++;
+            }
+            return crow::response(200, response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
     
+    CROW_ROUTE(app,"/case_status_history").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        auto body =crow::json::load(req.body);
+        if(!body) return crow::response(400,"INVALID JSON");
+        int case_id = body["case_id"].i();
+        std::string status = body["status"].s();
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec_params(
+                "INSERT INTO case_status_history (case_id, status) VALUES ($1, $2) RETURNING history_id",
+                case_id, status
+            );
+            txn.commit();
+
+            crow::json::wvalue response;
+            response["history_id"] = r[0][0].as<int>();
+            response["case_id"] = case_id;
+            response["status"] = status;
+            return crow::response(201, response);
+        }
+        catch(const std::exception e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
+    CROW_ROUTE(app, "/notifications")([](){
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result r = txn.exec(
+                "SELECT notification_id,case_id,message,sent FROM notification"
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            int i=0;
+            for(auto row : r){
+                response[i]["notification_id"] = row["notification_id"].as<int>();
+                response[i]["case_id"] = row["case_id"].as<int>();
+                response[i]["message"] = row["message"].c_str();
+                response[i]["sent"] = row["sent"].as<bool>();
+                i++;
+            }
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
+    CROW_ROUTE(app,"/notifications").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400,"INVALID JSON");
+        std::string message = body["message"].s();
+        int case_id = body["case_id"].i();
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec_params(
+                "INSERT INTO notification (case_id, message) VALUES ($1, $2) RETURNING notification_id",
+                case_id, message
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            response["notification_id"] = r[0][0].as<int>();
+            response["case_id"] = case_id;
+            response["message"] = message;
+            response["sent"] = false;
+            return crow::response(201, response);
+
+            
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
+    CROW_ROUTE(app,"/actions")([](){
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result r = txn.exec(
+                "SELECT action_id,case_id,resource_id,action_type,performed_at FROM action"
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            int i=0;
+            for(auto row : r){
+                response[i]["action_id"] = row["action_id"].as<int>();
+                response[i]["case_id"] = row["case_id"].as<int>(); 
+                response[i]["resource_id"] = row["resource_id"].as<int>();
+                response[i]["action_type"] = row["action_type"].c_str();
+                response[i]["performed_at"] = row["performed_at"].c_str();
+                i++;
+            }
+            return crow::response(200, response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+    CROW_ROUTE(app,"/actions").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400, "INVALID JSON");
+        int case_id = body["case_id"].i();
+        int resource_id = body["resource_id"].i();
+        std::string action_type = body["action_type"].s();
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result r = txn.exec_params(
+                "INSERT INTO action(case_id,resource_id,action_type) VALUES ($1, $2, $3) RETURNING action_id",
+                case_id, resource_id ,action_type
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            response["action_id"] = r[0][0].as<int>();
+            response["case_id"] = case_id;
+            response["resource_id"] = resource_id;
+            response["action_type"] = action_type;
+            return crow::response(201, response);
+        }
+
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
 
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
 }
