@@ -1,6 +1,10 @@
 #include "crow.h"
 #include <pqxx/pqxx>
+#include<ctime>
+#include<sstream>
+
     const int SHIFT_KEY = 5;
+
     std::string encryptPassword(const std::string& password) {
         std::string result = password;
         for (size_t i = 0; i < password.length(); i++) {
@@ -20,6 +24,68 @@
     }
     return result;
 }
+
+    std::string generateToken(int user_id,const std::string& role){
+        std::stringstream ss;
+        ss << user_id << ":" << role << ":" << time(nullptr);
+        std::string raw_token = ss.str();
+        return encryptPassword(raw_token); 
+    }
+
+    struct TokenData{
+        int user_id;
+        std::string role;
+        bool valid;
+    };
+
+    TokenData verifyToken(const std::string& token){
+        TokenData data;
+        data.valid = false;
+
+        try {
+            std::string decrypted = decryptPassword(token);
+            size_t first_colon = decrypted.find(':');
+            size_t second_colon = decrypted.find(':', first_colon + 1);
+            if (first_colon == std::string::npos || second_colon == std::string::npos) {
+                return data;  // format galat hai, invalid token
+            }
+            data.user_id = std::stoi(decrypted.substr(0, first_colon));
+            data.role = decrypted.substr(first_colon + 1, second_colon - first_colon - 1);
+            data.valid = true;
+        } catch (...) {
+            data.valid = false;  // decrypt fail hua, ya format galat tha
+        }
+        
+        return data;
+    }
+
+    bool isAuthorized(const crow::request& req, const std::string& required_role, crow::response& res) {
+    std::string token = req.get_header_value("Authorization");
+    if (token.empty()) {
+        crow::json::wvalue error;
+        error["error"] = "No token provided";
+        res = crow::response(401, error);
+        return false;
+    }
+
+    TokenData tokenData = verifyToken(token);
+    if (!tokenData.valid) {
+        crow::json::wvalue error;
+        error["error"] = "Invalid token";
+        res = crow::response(401, error);
+        return false;
+    }
+
+    if (tokenData.role != required_role) {
+        crow::json::wvalue error;
+        error["error"] = "Forbidden: insufficient permissions";
+        res = crow::response(403, error);
+        return false;
+    }
+
+    return true;
+    }
+    
 int main(){
     crow::SimpleApp app;  //this will create our server obj.
     
@@ -297,7 +363,7 @@ int main(){
             pqxx::work txn(conn);
 
             pqxx::result r = txn.exec_params(
-            "SELECT user_id, name, password_hash FROM app_user WHERE email = $1",
+            "SELECT user_id, name, password_hash,role FROM app_user WHERE email = $1",
             email
             );
             txn.commit();
@@ -309,9 +375,13 @@ int main(){
             
             std::string stored_encrypted = r[0]["password_hash"].c_str();
             if (encrypt_attempt == stored_encrypted) {
+                std::string role = r[0]["role"].c_str();  
+                std::string token = generateToken(r[0]["user_id"].as<int>(), role);
+    
                 crow::json::wvalue response;
                 response["user_id"] = r[0]["user_id"].as<int>();
                 response["name"] = r[0]["name"].c_str();
+                response["token"] = token;
                 response["message"] = "Login successful";
                 return crow::response(200, response);
             } else {
@@ -780,6 +850,54 @@ int main(){
         }
     });
 
+    //-------------------------till here we have completed all the backend which is related to database ------------------------------------------------------------------
 
+
+    CROW_ROUTE(app,"/verify-token").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400, "INVALID JSON");
+        std::string token = body["token"].s();
+        TokenData data = verifyToken(token);
+
+        crow::json::wvalue response;
+        response["valid"] = data.valid;
+        if(data.valid){
+            response["user_id"] = data.user_id;
+            response["role"] = data.role;
+        }
+        return crow::response(200, response);
+    });
+
+    CROW_ROUTE(app,"/users/<int>/role").methods(crow::HTTPMethod::PATCH)([](const crow::request& req,int user_id){
+         crow::response res;                          
+    if (!isAuthorized(req, "admin", res)) {     
+        return res;                               
+    }
+    auto body = crow::json::load(req.body);
+    if(!body) return crow::response(400, "INVALID JSON");
+    std::string new_role = body["role"].s();
+
+    try{
+        pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+        pqxx::work txn(conn);
+
+        txn.exec_params(
+            "UPDATE app_user SET role = $1 WHERE user_id = $2",
+            new_role, user_id
+        );
+        txn.commit();
+
+        crow::json::wvalue response;
+        response["user_id"] = user_id;
+        response["role"] = new_role;
+        return crow::response(200, response);
+    }
+    catch(const std::exception& e){
+        crow::json::wvalue error;
+        error["error"] = e.what();
+        return crow::response(500, error);
+    }
+
+    });
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
 }
