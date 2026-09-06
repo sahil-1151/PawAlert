@@ -1,8 +1,29 @@
 #include "crow.h"
 #include <pqxx/pqxx>
-
+    const int SHIFT_KEY = 5;
+    std::string encryptPassword(const std::string& password) {
+        std::string result = password;
+        for (size_t i = 0; i < password.length(); i++) {
+            int c = (int)password[i];
+            int shifted = 32 + ((c - 32 + SHIFT_KEY) % 95);
+            result[i] = (char)shifted;
+        }
+        return result;
+        }
+    //decryption algo
+    std::string decryptPassword(const std::string& encrypted) {
+    std::string result = encrypted;
+    for (size_t i = 0; i < encrypted.length(); i++) {
+        int c = (int)encrypted[i];
+        int shifted = 32 + (((c - 32 - SHIFT_KEY) % 95 + 95) % 95);
+        result[i] = (char)shifted;
+    }
+    return result;
+}
 int main(){
     crow::SimpleApp app;  //this will create our server obj.
+    
+    //http methods 
 
     CROW_ROUTE(app,"/db-test")([](){ // command is used to connect the db to the crow 
         try{
@@ -235,6 +256,179 @@ int main(){
             return crow::response(500, error);
         }
     });
+
+    CROW_ROUTE(app,"/users").methods(crow::HTTPMethod::POST)([](const crow::request& req){   //sign up post request.
+        auto body = crow::json::load(req.body);
+            if(!body) return crow::response(400,"INVALID JSON");
+            std::string name=body["name"].s();
+            std::string email = body["email"].s();
+            std::string password = body["password"].s();
+            std::string encrypt_password = encryptPassword(password);
+            try{
+                pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+                pqxx::work txn(conn);
+
+                pqxx::result r = txn.exec_params(
+                    "INSERT INTO app_user(name,email,password_hash) VALUES ($1,$2,$3) RETURNING user_id",
+                    name,email,encrypt_password
+                );
+                txn.commit();
+                crow::json::wvalue response;
+                response["user_id"] = r[0][0].as<int>();
+                response["name"] = name;
+                response["email"] = email;
+                return crow::response(201,response);
+            }
+            catch(const std::exception& e){
+                crow::json::wvalue error;
+                error["error"] = e.what();
+                return crow::response(500 , error);
+            }
+    });
+
+    CROW_ROUTE(app,"/login").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400, "INVALID JSON");
+        std::string email = body["email"].s();
+        std::string password = body["password"].s();
+        std::string encrypt_attempt = encryptPassword(password);
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec_params(
+            "SELECT user_id, name, password_hash FROM app_user WHERE email = $1",
+            email
+            );
+            txn.commit();
+            if(r.empty()){
+                crow::json::wvalue error;
+                error["error"] = "User Not Found";
+                return crow::response(404, error);
+            }
+            
+            std::string stored_encrypted = r[0]["password_hash"].c_str();
+            if (encrypt_attempt == stored_encrypted) {
+                crow::json::wvalue response;
+                response["user_id"] = r[0]["user_id"].as<int>();
+                response["name"] = r[0]["name"].c_str();
+                response["message"] = "Login successful";
+                return crow::response(200, response);
+            } else {
+                crow::json::wvalue error;
+                error["error"] = "Incorrect password";
+                return crow::response(401, error);
+            }
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500,error);
+        }
+    });
+
+    CROW_ROUTE(app,"/users")([](){
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec(
+                "SELECT user_id,name,email,role FROM app_user"
+            );
+            txn.commit();
+
+            crow::json::wvalue response;
+            int i=0;
+            for(auto row : r){
+                response[i]["user_id"] = row["user_id"].as<int>();
+                response[i]["name"] = row["name"].c_str();
+                response[i]["email"] = row["email"].c_str();
+                response[i]["role"] = row["role"].c_str();
+                i++;
+            }
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error); 
+        }
+    });
+
+    
+    CROW_ROUTE(app,"/users/<int>").methods(crow::HTTPMethod::PATCH)([](const crow::request& req,int user_id){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400,"INVALID JSON");
+        std::string name = body["name"].s();
+        std::string email = body["email"].s(); 
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            txn.exec_params(
+                "UPDATE app_user SET name =$1,email = $2 WHERE user_id = $3",
+                name,email,user_id);
+            txn.commit();
+
+            crow::json::wvalue response;
+            response["user_id"] = user_id;
+            response["name"] = name;
+            response["email"] = email;
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500,error);
+        }
+    });
+    CROW_ROUTE(app,"/users/<int>/password").methods(crow::HTTPMethod::PATCH)([](const crow::request &req,int user_id){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400,"INVALID JSON");
+        std::string current_password = body["current_password"].s();
+        std::string new_password = body["new_password"].s();
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec_params(
+                "SELECT password_hash FROM app_user WHERE user_id = $1",
+                user_id
+            );
+
+            if (r.empty()) {
+                crow::json::wvalue error;
+                error["error"] = "User not found";
+                return crow::response(404, error);
+            }
+            std::string stored_encrypted = r[0]["password_hash"].c_str();
+            std::string current_encrypted = encryptPassword(current_password);
+
+            bool passwordMatches = (current_encrypted == stored_encrypted);
+
+            if (!passwordMatches) {
+                crow::json::wvalue error;
+                error["error"] = "Current password is incorrect";
+                return crow::response(401, error);
+            }
+            std::string new_encrypted = encryptPassword(new_password);
+            txn.exec_params(
+            "UPDATE app_user SET password_hash = $1 WHERE user_id = $2",
+            new_encrypted, user_id
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            response["user_id"]=user_id;
+            response["message"]="Password Updated Successfully";
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
 
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
 }
