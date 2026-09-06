@@ -529,5 +529,93 @@ int main(){
             return crow::response(500, error);
         }
     });
+
+    CROW_ROUTE(app,"/reports")([](){
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result r = txn.exec(
+                "SELECT report_id,animal_type,condition,area_id,created_at FROM report"
+            );
+            crow::json::wvalue response;
+            int i=0;
+            for(auto row :r){
+                response[i]["report_id"] = row["report_id"].as<int>();
+                response[i]["animal_type"] = row["animal_type"].c_str();
+                response[i]["condition"] = row["condition"].c_str();
+                response[i]["area_id"] = row["area_id"].as<int>();
+                response[i]["created_at"] = row["created_at"].c_str();
+                i++;
+            }
+            return crow::response(200, response);
+        }
+            catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+           }
+
+    });
+
+    CROW_ROUTE(app,"/reports/<int>").methods(crow::HTTPMethod::DELETE)([](int report_id){
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            txn.exec_params(
+                "DELETE FROM report where report_id = $1",report_id);
+            txn.commit();
+            crow::json::wvalue response;
+            response["report_id"]=report_id;
+            response["message"]="Report deleted successfully";
+            return crow::response(200, response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500 ,error);
+        }
+    });
+
+    CROW_ROUTE(app, "/reports/full").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400, "INVALID JSON");
+
+        std::string animal_type = body["animal_type"].s();
+        std::string condition = body["condition"].s();
+        int area_id = body["area_id"].i();
+        
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            
+            pqxx::result r1 = txn.exec_params(
+                "INSERT INTO report (animal_type,condition,area_id) VALUES ($1,$2,$3) RETURNING report_id",
+                animal_type,condition,area_id
+            );
+            int report_id = r1[0][0].as<int>();
+
+            pqxx::result r2 = txn.exec_params(
+            "INSERT INTO animal_case (report_id, priority, status) VALUES ($1, 'routine', 'pending') RETURNING case_id",
+            report_id
+            );
+            int case_id = r2[0][0].as<int>();
+            txn.commit();
+
+            crow::json::wvalue response;
+            response["report_id"] = report_id;
+            response["case_id"] = case_id;
+            response["status"] = "pending";
+            return crow::response(201, response);
+        }
+        catch (const std::exception& e) {
+        crow::json::wvalue error;
+        error["error"] = e.what();
+        return crow::response(500, error);
+        }
+    });
+    
+
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
 }
