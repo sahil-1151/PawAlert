@@ -428,7 +428,106 @@ int main(){
             return crow::response(500, error);
         }
     });
+    
+    CROW_ROUTE(app,"/moderators").methods(crow::HTTPMethod::POST)([](const crow::request& req){ // moderator - post request.
+        auto body = crow::json::load(req.body);
+        if(!body) return crow::response(400 ,"INVALID JSON");
+        int user_id = body["user_id"].i();
+        int area_id = body["area_id"].i();
+        try{
+             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
 
+            pqxx::result r = txn.exec_params(
+                "INSERT INTO moderator(user_id,area_id) VALUES ($1,$2) RETURNING moderator_id",
+                user_id,area_id
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            response["moderator_id"] = r[0][0].as<int>();
+            response["user_id"] = user_id;
+            response["area_id"] = area_id;
+            return crow::response(201, response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500,error);
+        }
+    });
 
+    CROW_ROUTE(app,"/moderators")([](){
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec(
+                "SELECT moderator_id,user_id,area_id FROM moderator"
+            );
+            txn.commit();
+
+            crow::json::wvalue response;
+            int i=0;
+            for(auto row : r){
+                response[i]["moderator_id"] = row["moderator_id"].as<int>();
+                response[i]["user_id"] = row["user_id"].as<int>();
+                response[i]["area_id"] = row["area_id"].as<int>();
+                i++;
+            }
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500 , error);
+        }
+    });
+    CROW_ROUTE(app,"/moderators/<int>").methods(crow::HTTPMethod::PATCH)([](const crow::request& req,int moderator_id){ //moderator patch request.
+        auto body = crow::json::load(req.body);
+        if(!body)return crow::response(400 ,"INVALID JSON");
+        int area_id = body["area_id"].i();
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            pqxx::result r = txn.exec_params(
+                "UPDATE moderator SET area_id = $1 WHERE moderator_id = $2",
+                area_id,moderator_id
+            );
+            txn.commit();
+
+            crow::json::wvalue response;
+            response["moderator_id"] = moderator_id;
+            response["area_id"]= area_id;
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
+
+    CROW_ROUTE(app,"/moderators/<int>").methods(crow::HTTPMethod::DELETE)([](int moderator_id){ //moderator -delete request.
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+
+            txn.exec_params(
+                "DELETE FROM moderator WHERE moderator_id =$1",
+                moderator_id
+            );
+            txn.commit();
+            crow::json::wvalue response;
+            response["moderator_id"] = moderator_id;
+            response["message"] = "Moderator Removed Successfully";
+            return crow::response(200,response);
+        }
+        catch(const std::exception& e){
+            crow::json::wvalue error;
+            error["error"] = e.what();
+            return crow::response(500, error);
+        }
+    });
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
 }
