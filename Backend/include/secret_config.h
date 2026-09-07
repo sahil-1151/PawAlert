@@ -1,0 +1,6 @@
+#ifndef SECRET_CONFIG_H
+#define SECRET_CONFIG_H
+
+const int SHIFT_KEY = 5;
+
+#endif

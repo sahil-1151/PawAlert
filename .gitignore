@@ -1,4 +1,4 @@
 /Learning/
 /Backend/build/
 /Reports/
-Backend/src/secret_config.h
+include/secret_config.h

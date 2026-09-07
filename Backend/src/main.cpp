@@ -3,60 +3,44 @@
 #include<ctime>
 #include<sstream>
 #include "secret_config.h"
+#include "auth_utils.h"
+#include <queue>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
+struct Job{
+int case_id;
+std::string description;
+int priority; // priority goes up when number goes down.
+};
+std::queue<Job> jobQueue; // what are the jobs do we have.
+std::mutex queueMutex;  // create a lock over an job so that we can prevent racecondition
+std::condition_variable queueCV;
+bool stopWorkers = false;
 
-    std::string encryptPassword(const std::string& password) {
-        std::string result = password;
-        for (size_t i = 0; i < password.length(); i++) {
-            int c = (int)password[i];
-            int shifted = 32 + ((c - 32 + SHIFT_KEY) % 95);
-            result[i] = (char)shifted;
-        }
-        return result;
-        }
-    //decryption algo
-    std::string decryptPassword(const std::string& encrypted) {
-    std::string result = encrypted;
-    for (size_t i = 0; i < encrypted.length(); i++) {
-        int c = (int)encrypted[i];
-        int shifted = 32 + (((c - 32 - SHIFT_KEY) % 95 + 95) % 95);
-        result[i] = (char)shifted;
-    }
-    return result;
-}
+    void workerFunction(int worker_id) {
+    while (true) {
+        Job job;
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            queueCV.wait(lock, [] { return !jobQueue.empty() || stopWorkers; });
 
-    std::string generateToken(int user_id,const std::string& role){
-        std::stringstream ss;
-        ss << user_id << ":" << role << ":" << time(nullptr);
-        std::string raw_token = ss.str();
-        return encryptPassword(raw_token); 
-    }
-
-    struct TokenData{
-        int user_id;
-        std::string role;
-        bool valid;
-    };
-
-    TokenData verifyToken(const std::string& token){
-        TokenData data;
-        data.valid = false;
-
-        try {
-            std::string decrypted = decryptPassword(token);
-            size_t first_colon = decrypted.find(':');
-            size_t second_colon = decrypted.find(':', first_colon + 1);
-            if (first_colon == std::string::npos || second_colon == std::string::npos) {
-                return data;  // format galat hai, invalid token
+            if (stopWorkers && jobQueue.empty()) {
+                return;  // shutdown signal mila, aur kaam bhi khatam, ab thread band karo
             }
-            data.user_id = std::stoi(decrypted.substr(0, first_colon));
-            data.role = decrypted.substr(first_colon + 1, second_colon - first_colon - 1);
-            data.valid = true;
-        } catch (...) {
-            data.valid = false;  // decrypt fail hua, ya format galat tha
+
+            job = jobQueue.front();
+            jobQueue.pop();
         }
+
+        // Job process karo (abhi ke liye simple print, real system mein yahan
+        // actual notification bhejna ho sakta hai)
+        std::cout << "[Worker " << worker_id << "] Processing case " << job.case_id 
+                  << " (priority " << job.priority << "): " << job.description << std::endl;
         
-        return data;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));  // simulate karo ki kaam mein time lagta hai
+    }
     }
 
     bool isAuthorized(const crow::request& req, std::vector<std::string> allowed_roles, crow::response& res) {
@@ -96,6 +80,12 @@
     
 int main(){
     crow::SimpleApp app;  //this will create our server obj.
+
+    std::vector<std::thread> workers;
+    int NUM_WORKERS = 3;
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        workers.emplace_back(workerFunction, i);
+    }
     
     //http methods 
 
@@ -728,6 +718,12 @@ int main(){
             int case_id = r2[0][0].as<int>();
             txn.commit();
 
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                jobQueue.push({case_id, "New report needs moderator attention", 2});
+            }
+            queueCV.notify_one();
+
             crow::json::wvalue response;
             response["report_id"] = report_id;
             response["case_id"] = case_id;
@@ -979,4 +975,14 @@ int main(){
 
     });
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        stopWorkers = true;
+    }
+    queueCV.notify_all();
+    for (auto& w : workers) {
+        w.join();
+    }
+
+    return 0;
 }
