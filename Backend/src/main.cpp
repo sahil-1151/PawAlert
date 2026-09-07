@@ -13,8 +13,12 @@ struct Job{
 int case_id;
 std::string description;
 int priority; // priority goes up when number goes down.
+
+bool operator<(const Job& other) const {
+        return priority > other.priority;  // ULTA likha hai jaanbujh ke (neeche explain karunga)
+    }
 };
-std::queue<Job> jobQueue; // what are the jobs do we have.
+std::priority_queue<Job> jobQueue; // what are the jobs do we have.
 std::mutex queueMutex;  // create a lock over an job so that we can prevent racecondition
 std::condition_variable queueCV;
 bool stopWorkers = false;
@@ -30,7 +34,7 @@ bool stopWorkers = false;
                 return;  // shutdown signal mila, aur kaam bhi khatam, ab thread band karo
             }
 
-            job = jobQueue.front();
+            job = jobQueue.top();
             jobQueue.pop();
         }
 
@@ -81,8 +85,10 @@ bool stopWorkers = false;
 int main(){
     crow::SimpleApp app;  //this will create our server obj.
 
+    int NUM_WORKERS = std::thread::hardware_concurrency();
+    if (NUM_WORKERS == 0) NUM_WORKERS = 3;
+    std::cout << "Detected " << NUM_WORKERS << " CPU cores. Starting " << NUM_WORKERS << " worker threads." << std::endl;
     std::vector<std::thread> workers;
-    int NUM_WORKERS = 3;
     for (int i = 0; i < NUM_WORKERS; i++) {
         workers.emplace_back(workerFunction, i);
     }
@@ -692,50 +698,52 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app, "/reports/full").methods(crow::HTTPMethod::POST)([](const crow::request& req){
-        auto body = crow::json::load(req.body);
-        if(!body) return crow::response(400, "INVALID JSON");
+   CROW_ROUTE(app, "/reports/full").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+    auto body = crow::json::load(req.body);
+    if(!body) return crow::response(400, "INVALID JSON");
 
-        std::string animal_type = body["animal_type"].s();
-        std::string condition = body["condition"].s();
-        int area_id = body["area_id"].i();
-        
-        try{
-            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
-            pqxx::work txn(conn);
+    std::string animal_type = body["animal_type"].s();
+    std::string condition = body["condition"].s();
+    int area_id = body["area_id"].i();
+    int priority = body.has("priority") ? body["priority"].i() : 2;   // naya: body se priority lo
 
-            
-            pqxx::result r1 = txn.exec_params(
-                "INSERT INTO report (animal_type,condition,area_id) VALUES ($1,$2,$3) RETURNING report_id",
-                animal_type,condition,area_id
-            );
-            int report_id = r1[0][0].as<int>();
+    try{
+        pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+        pqxx::work txn(conn);
 
-            pqxx::result r2 = txn.exec_params(
-            "INSERT INTO animal_case (report_id, priority, status) VALUES ($1, 'routine', 'pending') RETURNING case_id",
-            report_id
-            );
-            int case_id = r2[0][0].as<int>();
-            txn.commit();
+        pqxx::result r1 = txn.exec_params(
+            "INSERT INTO report (animal_type,condition,area_id) VALUES ($1,$2,$3) RETURNING report_id",
+            animal_type, condition, area_id
+        );
+        int report_id = r1[0][0].as<int>();
 
-            {
-                std::lock_guard<std::mutex> lock(queueMutex);
-                jobQueue.push({case_id, "New report needs moderator attention", 2});
-            }
-            queueCV.notify_one();
+        std::string priority_label = (priority == 1) ? "urgent" : "routine";   // naya: number ko label mein badlo
 
-            crow::json::wvalue response;
-            response["report_id"] = report_id;
-            response["case_id"] = case_id;
-            response["status"] = "pending";
-            return crow::response(201, response);
+        pqxx::result r2 = txn.exec_params(
+            "INSERT INTO animal_case (report_id, priority, status) VALUES ($1, $2, 'pending') RETURNING case_id",
+            report_id, priority_label
+        );
+        int case_id = r2[0][0].as<int>();
+        txn.commit();
+
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            jobQueue.push({case_id, "New report needs moderator attention", priority});   // ab variable use ho raha hai
         }
-        catch (const std::exception& e) {
+        queueCV.notify_one();
+
+        crow::json::wvalue response;
+        response["report_id"] = report_id;
+        response["case_id"] = case_id;
+        response["status"] = "pending";
+        return crow::response(201, response);
+    }
+    catch (const std::exception& e) {
         crow::json::wvalue error;
         error["error"] = e.what();
         return crow::response(500, error);
-        }
-    });
+    }
+});
 
     CROW_ROUTE(app,"/case_status_history")([](const crow::request& req){    //get request for case_status_history.
         crow::response res;
@@ -974,6 +982,46 @@ int main(){
     }
 
     });
+
+    CROW_ROUTE(app,"/dashboard/summary")([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req,{"moderator","admin"},res)){
+            return res;
+        }
+        try{
+        pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+        pqxx::work txn(conn);
+
+        pqxx::result pendingCount = txn.exec("SELECT COUNT(*) FROM animal_case WHERE status = 'pending'");
+        
+        pqxx::result areaWise = txn.exec(
+            "SELECT a.area_name, COUNT(ac.case_id) AS pending_cases "
+            "FROM animal_case ac "
+            "JOIN report r ON ac.report_id = r.report_id "
+            "JOIN area a ON r.area_id = a.area_id "
+            "WHERE ac.status = 'pending' "
+            "GROUP BY a.area_name "
+            "ORDER BY pending_cases DESC"
+        );
+
+        txn.commit();
+        crow::json::wvalue response;
+        response["total_pending"] = pendingCount[0][0].as<int>();
+        int i=0;
+        for(auto row:areaWise){
+            response["area_wise_pending"][i]["area_name"] = row["area_name"].c_str();
+            response["area_wise_pending"][i]["pending_cases"] = row["pending_cases"].as<int>();
+            i++;
+        }
+        return crow::response(200, response);
+        }
+    catch(const std::exception& e){
+        crow::json::wvalue error;
+        error["error"] = e.what();
+        return crow::response(500, error);
+    }
+    });
+
     app.port(8080).multithreaded().run();        //serve this server on port 8080 and we can handle multiple request which is imp for os.
     {
         std::lock_guard<std::mutex> lock(queueMutex);
