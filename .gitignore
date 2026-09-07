@@ -2,3 +2,5 @@
 /Backend/build/
 /Reports/
 include/secret_config.h
+.env
+__pycache__/

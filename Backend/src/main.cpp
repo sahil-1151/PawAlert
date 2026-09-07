@@ -8,6 +8,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include "crow/middlewares/cors.h"
 
 struct Job{
 int case_id;
@@ -83,7 +84,13 @@ bool stopWorkers = false;
     }
     
 int main(){
-    crow::SimpleApp app;  //this will create our server obj.
+    crow::App<crow::CORSHandler> app;  //this will create our server obj.
+     auto& cors = app.get_middleware<crow::CORSHandler>();
+    cors
+        .global()
+        .headers("Content-Type", "Authorization")
+        .methods("GET"_method, "POST"_method, "PATCH"_method, "DELETE"_method, "OPTIONS"_method)
+        .origin("*");
 
     int NUM_WORKERS = std::thread::hardware_concurrency();
     if (NUM_WORKERS == 0) NUM_WORKERS = 3;
