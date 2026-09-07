@@ -2,8 +2,8 @@
 #include <pqxx/pqxx>
 #include<ctime>
 #include<sstream>
+#include "secret_config.h"
 
-    const int SHIFT_KEY = 5;
 
     std::string encryptPassword(const std::string& password) {
         std::string result = password;
@@ -59,7 +59,7 @@
         return data;
     }
 
-    bool isAuthorized(const crow::request& req, const std::string& required_role, crow::response& res) {
+    bool isAuthorized(const crow::request& req, std::vector<std::string> allowed_roles, crow::response& res) {
     std::string token = req.get_header_value("Authorization");
     if (token.empty()) {
         crow::json::wvalue error;
@@ -76,7 +76,15 @@
         return false;
     }
 
-    if (tokenData.role != required_role) {
+    bool roleMatched = false;
+    for (const std::string& role : allowed_roles) {
+        if (tokenData.role == role) {
+            roleMatched = true;
+            break;
+        }
+    }
+
+    if (!roleMatched) {
         crow::json::wvalue error;
         error["error"] = "Forbidden: insufficient permissions";
         res = crow::response(403, error);
@@ -149,6 +157,10 @@ int main(){
             });
 
     CROW_ROUTE(app,"/areas/<int>").methods(crow::HTTPMethod::PATCH)([](const crow::request& req, int area_id){ //patch request. 
+        crow::response res;
+        if(!isAuthorized(req, {"moderator", "admin"}, res)) {
+            return res;
+        }
         auto body = crow::json::load(req.body);
             if(!body) return crow::response(400, "INVALID JSON");
             std::string new_name = body["area_name"].s();
@@ -176,6 +188,10 @@ int main(){
     });
 
     CROW_ROUTE(app,"/areas").methods(crow::HTTPMethod::POST)([](const crow::request& req){ //post request.
+        crow::response res;
+        if(!isAuthorized(req, {"moderator", "admin"}, res)) {
+            return res;
+        }
         auto body = crow::json::load(req.body);
         if(!body) return crow::response(400, "INVALID JSON");
         std::string area_name = body["area_name"].s();
@@ -224,6 +240,10 @@ int main(){
     });
 
     CROW_ROUTE(app,"/resources").methods(crow::HTTPMethod::POST)([](const crow::request& req){  //post for resource.
+        crow::response res;
+        if(!isAuthorized(req, {"admin"}, res)) {
+        return res;
+        }   
         auto body = crow::json::load(req.body);
             if(!body) return crow::response(400, "INVALID JSON");
             std::string resource_type = body["resource_type"].s();
@@ -277,6 +297,11 @@ int main(){
 
     CROW_ROUTE(app,"/resources/<int>").methods(crow::HTTPMethod::PATCH)([](
         const crow::request& req,int resource_id){
+
+        crow::response res;
+        if(!isAuthorized(req, {"moderator","admin"}, res)) {
+        return res;
+
             auto body = crow::json::load(req.body);
             if(!body) return crow::response(400, "INVALID JSON");
             bool available = body["available"].b();
@@ -300,9 +325,15 @@ int main(){
             error["error"] = e.what();
             return crow::response(500,error);
         } 
-        });
+        }
+    });
     
-    CROW_ROUTE(app,"/resources/<int>").methods(crow::HTTPMethod::DELETE)([](int resource_id){
+    CROW_ROUTE(app,"/resources/<int>").methods(crow::HTTPMethod::DELETE)([](const crow::request& req,int resource_id){
+        crow::response res;
+        if(!isAuthorized(req,{"admin"},res)){
+            return res;
+        }
+
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -397,7 +428,11 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app,"/users")([](){
+    CROW_ROUTE(app,"/users")([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req, {"admin"}, res)) {
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -500,6 +535,10 @@ int main(){
     });
     
     CROW_ROUTE(app,"/moderators").methods(crow::HTTPMethod::POST)([](const crow::request& req){ // moderator - post request.
+        crow::response res;
+        if(!isAuthorized(req,{"admin"},res)){
+            return res;
+        }
         auto body = crow::json::load(req.body);
         if(!body) return crow::response(400 ,"INVALID JSON");
         int user_id = body["user_id"].i();
@@ -526,7 +565,11 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app,"/moderators")([](){
+    CROW_ROUTE(app,"/moderators")([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req,{"admin"},res)){
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -553,6 +596,10 @@ int main(){
         }
     });
     CROW_ROUTE(app,"/moderators/<int>").methods(crow::HTTPMethod::PATCH)([](const crow::request& req,int moderator_id){ //moderator patch request.
+        crow::response res;
+        if(!isAuthorized(req,{"admin"},res)){
+            return res;
+        }
         auto body = crow::json::load(req.body);
         if(!body)return crow::response(400 ,"INVALID JSON");
         int area_id = body["area_id"].i();
@@ -578,7 +625,11 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app,"/moderators/<int>").methods(crow::HTTPMethod::DELETE)([](int moderator_id){ //moderator -delete request.
+    CROW_ROUTE(app,"/moderators/<int>").methods(crow::HTTPMethod::DELETE)([](const crow::request& req,int moderator_id){ //moderator -delete request.
+        crow::response res;
+        if (!isAuthorized(req, {"admin"}, res)) {
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -627,7 +678,11 @@ int main(){
 
     });
 
-    CROW_ROUTE(app,"/reports/<int>").methods(crow::HTTPMethod::DELETE)([](int report_id){
+    CROW_ROUTE(app,"/reports/<int>").methods(crow::HTTPMethod::DELETE)([](const crow::request& req,int report_id){
+        crow::response res;
+        if(!isAuthorized(req,{"admin"},res)){
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -686,7 +741,11 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app,"/case_status_history")([](){    //get request for case_status_history.
+    CROW_ROUTE(app,"/case_status_history")([](const crow::request& req){    //get request for case_status_history.
+        crow::response res;
+        if(!isAuthorized(req,{"admin"},res)){
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -712,6 +771,10 @@ int main(){
     });
     
     CROW_ROUTE(app,"/case_status_history").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req,{"admin","moderator"},res)){
+            return res;
+        }
         auto body =crow::json::load(req.body);
         if(!body) return crow::response(400,"INVALID JSON");
         int case_id = body["case_id"].i();
@@ -739,7 +802,11 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app, "/notifications")([](){
+    CROW_ROUTE(app, "/notifications")([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req,{"admin","moderator"},res)){
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -766,6 +833,10 @@ int main(){
     });
 
     CROW_ROUTE(app,"/notifications").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req,{"admin","moderator"},res)){
+            return res;
+        }
         auto body = crow::json::load(req.body);
         if(!body) return crow::response(400,"INVALID JSON");
         std::string message = body["message"].s();
@@ -795,7 +866,11 @@ int main(){
         }
     });
 
-    CROW_ROUTE(app,"/actions")([](){
+    CROW_ROUTE(app,"/actions")([](const crow::request& req){
+        crow::response res;
+        if(!isAuthorized(req,{"admin","moderator"},res)){
+            return res;
+        }
         try{
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
@@ -822,6 +897,10 @@ int main(){
         }
     });
     CROW_ROUTE(app,"/actions").methods(crow::HTTPMethod::POST)([](const crow::request& req){
+        crow::response res;
+        if (!isAuthorized(req, {"moderator", "admin"}, res)) {   
+            return res;
+        }
         auto body = crow::json::load(req.body);
         if(!body) return crow::response(400, "INVALID JSON");
         int case_id = body["case_id"].i();
@@ -869,8 +948,8 @@ int main(){
     });
 
     CROW_ROUTE(app,"/users/<int>/role").methods(crow::HTTPMethod::PATCH)([](const crow::request& req,int user_id){
-         crow::response res;                          
-    if (!isAuthorized(req, "admin", res)) {     
+    crow::response res;                          
+    if (!isAuthorized(req,{"admin"}, res)) {     
         return res;                               
     }
     auto body = crow::json::load(req.body);
