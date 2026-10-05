@@ -42,12 +42,32 @@ async function request(path, { method = "GET", body, authenticated = false } = {
   return data;
 }
 const post = (path, body, authenticated = false) => request(path, { method: "POST", body, authenticated });
+const dashboardCacheKey = "pawalert_dashboard_cache";
+const clearDashboardCache = () => sessionStorage.removeItem(dashboardCacheKey);
+const pause = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+function cachedDashboard() {
+  try {
+    const cached = JSON.parse(sessionStorage.getItem(dashboardCacheKey) || "null");
+    const user = currentUser();
+    return cached && cached.token === user?.token && Date.now() - cached.savedAt < 30000 ? cached.data : null;
+  } catch (_) { return null; }
+}
+async function getDashboardData(showWelcomeCat = false) {
+  const cached = cachedDashboard();
+  if (cached) return cached;
+  const startedAt = performance.now();
+  const data = await request("/dashboard", { authenticated: true });
+  try { sessionStorage.setItem(dashboardCacheKey, JSON.stringify({ token: currentUser()?.token, savedAt: Date.now(), data })); } catch (_) { /* A large photo should never prevent the dashboard from opening. */ }
+  if (showWelcomeCat) await pause(Math.max(0, 1200 - (performance.now() - startedAt)));
+  return data;
+}
 
 async function submitPendingReport() {
   const stored = sessionStorage.getItem("pawalert_pending_report");
   if (!stored) return null;
   const report = await post("/reports/full", JSON.parse(stored), true);
   sessionStorage.removeItem("pawalert_pending_report");
+  clearDashboardCache();
   return report;
 }
 const reportComplete = (report) => location.assign(report ? `success.html?report=${encodeURIComponent(report.report_id)}` : "success.html");
@@ -68,6 +88,51 @@ function openOtpDialog(form, email) {
   document.body.append(dialog); dialog.querySelector(".otp-modal-input").focus();
 }
 let capturedReportPhoto = "";
+const conditionSelect = document.querySelector("#condition");
+if (conditionSelect) {
+  const customCondition = document.querySelector("#condition-other-field");
+  const customInput = customCondition.querySelector("input");
+  conditionSelect.addEventListener("change", () => {
+    const showCustom = conditionSelect.value === "Other / not listed";
+    customCondition.hidden = !showCustom;
+    customInput.required = showCustom;
+    if (!showCustom) customInput.value = "";
+  });
+}
+const authoritySelect = document.querySelector("#authority-type");
+if (authoritySelect) {
+  const authorityNote = document.querySelector("#authority-note");
+  const authorityMessages = {
+    government: "Government reports are kept within the responsible local-response workflow.",
+    ngo: "This report is routed for animal-welfare NGO follow-up; it is not shown publicly.",
+    private_ngo: "This report is routed for private rescue follow-up; it is not shown publicly.",
+    community: "This report will appear in PawAlert Community so local members can see its progress.",
+    other: "This report is recorded for the selected local authority; it is not shown publicly."
+  };
+  authoritySelect.addEventListener("change", () => { authorityNote.textContent = authorityMessages[authoritySelect.value]; });
+}
+let reportMap;
+let reportPin;
+function setReportPin(latitude, longitude, zoom = true) {
+  const lat = Number(latitude); const lng = Number(longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  document.querySelector('[name="latitude"]').value = lat.toFixed(6);
+  document.querySelector('[name="longitude"]').value = lng.toFixed(6);
+  document.querySelector("#map-status").textContent = `Pin selected: ${lat.toFixed(6)}, ${lng.toFixed(6)}. You can drag it to refine the point.`;
+  if (!reportMap) return;
+  if (!reportPin) reportPin = L.marker([lat, lng], { draggable: true }).addTo(reportMap);
+  else reportPin.setLatLng([lat, lng]);
+  reportPin.off("dragend").on("dragend", () => { const point = reportPin.getLatLng(); setReportPin(point.lat, point.lng, false); });
+  if (zoom) reportMap.setView([lat, lng], 16);
+}
+function initialiseReportMap() {
+  const mapElement = document.querySelector("#report-map");
+  if (!mapElement || !window.L) return;
+  reportMap = L.map(mapElement, { zoomControl: true }).setView([30.3165, 78.0322], 13);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: "© OpenStreetMap contributors" }).addTo(reportMap);
+  reportMap.on("click", ({ latlng }) => setReportPin(latlng.lat, latlng.lng));
+}
+initialiseReportMap();
 const takePhotoButton = document.querySelector("#take-photo");
 if (takePhotoButton) takePhotoButton.addEventListener("click", async () => {
   const cameraStatus = document.querySelector("#camera-photo-status");
@@ -96,6 +161,7 @@ if (locationButton) {
     navigator.geolocation.getCurrentPosition(async ({ coords }) => {
       const fallback = `${coords.latitude.toFixed(6)}, ${coords.longitude.toFixed(6)}`;
       fill("location", fallback);
+      setReportPin(coords.latitude, coords.longitude);
       try {
         setLocationStatus("Finding the nearby address…");
         const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(coords.latitude)}&lon=${encodeURIComponent(coords.longitude)}&zoom=18&addressdetails=1`;
@@ -122,7 +188,7 @@ document.querySelectorAll("form[data-api]").forEach((form) => form.addEventListe
     if (mode === "report") { const photo = form.querySelector('[name="upload_photo"]').files?.[0]; delete values.upload_photo; if (capturedReportPhoto) values.photo = capturedReportPhoto; else if (photo) { if (photo.size > 3 * 1024 * 1024) throw new Error("Please choose an image smaller than 3 MB"); values.photo = await new Promise((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = reject; reader.readAsDataURL(photo); }); } else delete values.photo; sessionStorage.setItem("pawalert_pending_report", JSON.stringify(values)); if (!currentUser()?.token) location.assign("login.html?next=report"); else reportComplete(await submitPendingReport()); return; }
     if (mode === "login") { setStatus(form, "Logging you in…"); const user = await post("/login", values); localStorage.setItem("pawalert_user", JSON.stringify({ ...user, email: values.email })); const report = await submitPendingReport(); if (report) reportComplete(report); else { sessionStorage.setItem("pawalert_login_loading", "true"); location.assign("dashboard.html"); } return; }
     if (!form.dataset.otpSent) { setStatus(form, "Sending verification code…"); const result = await post("/auth/send-otp", { email: values.email, purpose: "signup" }); setStatus(form, result.message || "Verification code sent.", "success"); openOtpDialog(form, values.email); return; }
-    setStatus(form, "Verifying your code…"); await post("/auth/verify-otp", { email: values.email, otp: values.otp }); const user = await post("/users", { name: values.name, email: values.email, password: values.password }); localStorage.setItem("pawalert_user", JSON.stringify({ ...user, email: values.email })); location.assign("dashboard.html");
+    setStatus(form, "Verifying your code…"); await post("/auth/verify-otp", { email: values.email, otp: values.otp }); const user = await post("/users", { name: values.name, email: values.email, password: values.password }); localStorage.setItem("pawalert_user", JSON.stringify({ ...user, email: values.email })); sessionStorage.setItem("pawalert_login_loading", "true"); location.assign("dashboard.html");
   } catch (error) { setStatus(form, error.message, "error"); } finally { button.disabled = false; }
 }));
 
@@ -131,7 +197,7 @@ const labelForRole = (role) => ({ citizen: "Citizen", moderator: "Moderator", ad
 updateNavigation();
 function reportCards(reports, emptyText, canUpload = false) {
   if (!reports?.length) return `<p class="empty-state">${emptyText}</p>`;
-  return reports.map((r) => `<article class="report-card ${r.completion_photo ? "report-card-photo" : ""}"><div><span class="status status-${escapeHtml(r.status).toLowerCase()}">${escapeHtml(r.status)}</span><h3>${escapeHtml(r.animal_type)}</h3><p>${escapeHtml(r.condition)} · ${escapeHtml(r.location || r.area)}, ${escapeHtml(r.city || r.area)}</p>${r.completion_photo ? `<button class="completion-photo-button" type="button" data-completion-photo="${escapeHtml(r.completion_photo)}" data-completion-caption="Treatment completed · ${escapeHtml(r.animal_type)}"><img class="completion-photo" src="${escapeHtml(r.completion_photo)}" alt="Animal after treatment for report #${escapeHtml(r.report_id)}" loading="lazy" decoding="async"><span>View treatment photo</span></button>` : ""}${r.status === "completed" && !r.completion_photo ? `<p class="photo-pending">${canUpload ? "Add a post-treatment photo below." : "Treatment completed · photo update awaited from the rescue team."}</p>` : ""}${canUpload && r.status === "completed" && !r.completion_photo ? `<label class="completion-upload">Add treatment photo<input type="file" accept="image/jpeg,image/png,image/webp" data-completion-upload="${escapeHtml(r.report_id)}"></label>` : ""}</div><div class="report-meta"><strong>#${escapeHtml(r.report_id)}</strong><span>${new Date(r.created_at).toLocaleDateString()}</span></div></article>`).join("");
+  return reports.map((r) => `<article class="report-card"><div>${r.report_photo ? `<button class="report-photo-button" type="button" data-report-photo="${escapeHtml(r.report_photo)}" data-report-caption="Report photo · ${escapeHtml(r.animal_type)}"><img class="report-photo-thumb" src="${escapeHtml(r.report_photo)}" alt="Photo submitted for report #${escapeHtml(r.report_id)}" loading="lazy" decoding="async"><span>View report pics</span></button>` : ""}<h3>${escapeHtml(r.animal_type)}${r.animal_species ? ` <small>· ${escapeHtml(r.animal_species)}</small>` : ""}</h3><p>${escapeHtml(r.condition)} · ${escapeHtml(r.location || r.area)}, ${escapeHtml(r.city || r.area)}</p>${r.authority_type === "community" ? '<span class="community-label">Community report</span>' : ""}${r.completion_photo ? `<button class="completion-photo-button" type="button" data-completion-photo="${escapeHtml(r.completion_photo)}" data-completion-caption="Treatment completed · ${escapeHtml(r.animal_type)}"><img class="completion-photo" src="${escapeHtml(r.completion_photo)}" alt="Animal after treatment for report #${escapeHtml(r.report_id)}" loading="lazy" decoding="async"><span>View treatment photo</span></button>` : ""}${r.status === "completed" && !r.completion_photo ? `<p class="photo-pending">${canUpload ? "Add a post-treatment photo below." : "Treatment completed · photo update awaited from the rescue team."}</p>` : ""}${canUpload && r.status === "completed" && !r.completion_photo ? `<label class="completion-upload">Add treatment photo<input type="file" accept="image/jpeg,image/png,image/webp" data-completion-upload="${escapeHtml(r.report_id)}"></label>` : ""}</div><div class="report-meta"><strong>#${escapeHtml(r.report_id)}</strong><button class="status status-${escapeHtml(r.status).toLowerCase()} status-button" type="button" data-case-status="${escapeHtml(r.status)}" data-report-id="${escapeHtml(r.report_id)}" aria-label="View progress for report ${escapeHtml(r.report_id)}">${escapeHtml(r.status).replaceAll("_", " ")}</button><time>${new Date(r.created_at).toLocaleDateString()}</time></div></article>`).join("");
 }
 function dashboardSkeleton(withCat = false) {
   return `<section class="dashboard-skeleton" aria-label="Loading dashboard"><div class="skeleton-line skeleton-eyebrow"></div><div class="skeleton-line skeleton-heading"></div><div class="skeleton-line skeleton-copy"></div><div class="skeleton-stat-row"><span></span><span></span><span></span></div><div class="skeleton-section"><div class="skeleton-line skeleton-title"></div><div class="skeleton-card-grid"><article></article><article></article></div></div>${withCat ? '<div class="welcome-cat-loader"><span>🐈</span><p>Preparing your PawAlert dashboard…</p></div>' : ''}</section>`;
@@ -145,10 +211,11 @@ async function loadDashboard() {
   container.innerHTML = dashboardSkeleton(showWelcomeCat);
   await afterNextPaint();
   try {
-    const data = await request("/dashboard", { authenticated: true }); const citizen = data.profile.role === "citizen"; const focusTitle = citizen ? "My reports" : data.profile.role === "moderator" ? "Reports in my area" : "All reports"; const focusReports = Array.isArray(citizen ? data.my_reports : data.managed_reports) ? (citizen ? data.my_reports : data.managed_reports) : []; const communityReports = Array.isArray(data.community_reports) ? data.community_reports : [];
+    const data = await getDashboardData(showWelcomeCat); const citizen = data.profile.role === "citizen"; const focusTitle = citizen ? "My reports" : data.profile.role === "moderator" ? "Reports in my area" : "All reports"; const focusReports = Array.isArray(citizen ? data.my_reports : data.managed_reports) ? (citizen ? data.my_reports : data.managed_reports) : []; const communityReports = Array.isArray(data.community_reports) ? data.community_reports : [];
     const canUpload = ["moderator", "admin"].includes(data.profile.role);
     container.innerHTML = `<section class="dashboard-hero"><div><p class="eyebrow"><span></span> ${labelForRole(data.profile.role)} dashboard</p><h1>Welcome, ${escapeHtml(data.profile.name)}.</h1><p>Keep up with the cases and people who need your attention.</p></div><aside class="profile-card"><div class="profile-avatar">${escapeHtml(data.profile.name.charAt(0).toUpperCase())}</div><div><strong>${escapeHtml(data.profile.name)}</strong><span>${escapeHtml(data.profile.email)}</span><small>${labelForRole(data.profile.role)}</small></div></aside></section><section class="dashboard-stats"><article><span>${citizen ? "Reports submitted" : "Cases in view"}</span><strong>${data.stats.total_cases}</strong></article><article><span>Pending attention</span><strong>${data.stats.pending_cases}</strong></article><article><span>Community updates</span><strong>${communityReports.length}</strong></article></section><section class="dashboard-section"><div class="section-title"><div><p class="eyebrow"><span></span> Your workspace</p><h2>${focusTitle}</h2></div>${citizen ? '<a class="button button-primary" href="report.html">Make a report <span>→</span></a>' : ""}</div><div class="report-grid">${reportCards(focusReports, "No reports are available yet.", canUpload)}</div></section>`;
     attachCompletionUploads(container);
+    attachModeratorLocationControl(container, data.profile.role);
   } catch (error) { container.innerHTML = `<section class="dashboard-error"><h1>Dashboard unavailable</h1><p>${escapeHtml(error.message)}</p><a class="button button-primary" href="login.html">Log in again</a></section>`; }
 }
 async function loadCommunity() {
@@ -157,7 +224,7 @@ async function loadCommunity() {
   container.innerHTML = dashboardSkeleton(false);
   await afterNextPaint();
   try {
-    const data = await request("/dashboard", { authenticated: true });
+    const data = await getDashboardData();
     const reports = Array.isArray(data.community_reports) ? data.community_reports : [];
     const urgentCount = reports.filter((report) => report.priority === "urgent").length;
     const pendingCount = reports.filter((report) => report.status === "pending").length;
@@ -179,18 +246,62 @@ function attachCompletionUploads(container) {
     if (file.size > 3 * 1024 * 1024) { alert("Please choose an image smaller than 3 MB."); input.value = ""; return; }
     const reader = new FileReader();
     reader.onload = async () => {
-      try { await post(`/reports/${input.dataset.completionUpload}/completion-photo`, { photo: reader.result }, true); location.reload(); }
+      try { await post(`/reports/${input.dataset.completionUpload}/completion-photo`, { photo: reader.result }, true); clearDashboardCache(); location.reload(); }
       catch (error) { alert(error.message); input.value = ""; }
     };
     reader.readAsDataURL(file);
   }));
 }
+let moderatorLocationWatch;
+function attachModeratorLocationControl(container, role) {
+  if (!['moderator', 'admin'].includes(role) || container.querySelector('[data-share-location]')) return;
+  const profile = container.querySelector('.profile-card'); if (!profile) return;
+  const control = document.createElement('div'); control.className = 'moderator-location-control';
+  control.innerHTML = '<button class="button button-location" type="button" data-share-location>⌖ Share live location</button><p aria-live="polite">Off until you choose to share.</p>';
+  control.querySelector('[data-share-location]').addEventListener('click', () => {
+    const note = control.querySelector('p');
+    if (!navigator.geolocation) { note.textContent = 'Location is unavailable in this browser.'; return; }
+    note.textContent = 'Requesting permission…';
+    const update = async ({ coords }) => { try { await post('/moderator/location', { latitude: String(coords.latitude), longitude: String(coords.longitude) }, true); note.textContent = `Live location shared · updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`; } catch (error) { note.textContent = error.message; } };
+    navigator.geolocation.getCurrentPosition(update, () => { note.textContent = 'Location permission was not granted.'; }, { enableHighAccuracy: true, timeout: 10000 });
+    if (moderatorLocationWatch !== undefined) navigator.geolocation.clearWatch(moderatorLocationWatch);
+    moderatorLocationWatch = navigator.geolocation.watchPosition(update, () => {}, { enableHighAccuracy: true, maximumAge: 15000, timeout: 20000 });
+  });
+  profile.append(control);
+}
 document.addEventListener("click", (event) => {
-  const photo = event.target.closest("[data-completion-photo]");
+  const statusButton = event.target.closest("[data-case-status]");
+  if (statusButton) {
+    const current = statusButton.dataset.caseStatus.toLowerCase().replaceAll("_", " ");
+    const progressOrder = ["pending", "verified", "in progress", "completed"];
+    const currentIndex = Math.max(0, progressOrder.indexOf(current));
+    const labels = ["Report received", "Verified", "Rescue in progress", "Completed"];
+    const details = ["Your report has reached the PawAlert queue.", "A responder has reviewed the report details.", "A rescue team is working on the case.", "The case has been marked complete."];
+    const dialog = document.createElement("div"); dialog.className = "progress-modal";
+    dialog.innerHTML = `<div class="progress-panel" role="dialog" aria-modal="true" aria-label="Report progress"><button class="progress-close" type="button" aria-label="Close progress">×</button><p class="eyebrow"><span></span> Report #${escapeHtml(statusButton.dataset.reportId)}</p><h2>Case progress</h2><p class="progress-summary">Current status: <strong>${escapeHtml(current)}</strong></p><ol class="progress-timeline">${labels.map((label, index) => `<li class="${index < currentIndex ? "done" : index === currentIndex ? "current" : ""}"><span>${index < currentIndex ? "✓" : index + 1}</span><div><strong>${label}</strong><p>${details[index]}</p></div></li>`).join("")}</ol><section class="tracking-panel"><strong>Live responder location</strong><p data-tracking-note>Checking for a responder location…</p><div class="tracking-map" data-tracking-map hidden></div></section></div>`;
+    dialog.addEventListener("click", (click) => { if (click.target === dialog || click.target.closest(".progress-close")) dialog.remove(); });
+    document.body.append(dialog);
+    request(`/reports/${statusButton.dataset.reportId}/tracking`, { authenticated: true }).then((tracking) => {
+      const note = dialog.querySelector('[data-tracking-note]');
+      if (!tracking.available) { note.textContent = 'No responder has shared a live location yet.'; return; }
+      note.textContent = `${tracking.moderator_name} last shared a location at ${new Date(tracking.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`;
+      const mapElement = dialog.querySelector('[data-tracking-map]');
+      if (!window.L) return;
+      mapElement.hidden = false;
+      const map = L.map(mapElement, { zoomControl: false, attributionControl: false }).setView([tracking.latitude, tracking.longitude], 15);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+      L.marker([tracking.latitude, tracking.longitude]).addTo(map).bindPopup('Responder location').openPopup();
+    }).catch(() => { const note = dialog.querySelector('[data-tracking-note]'); note.textContent = 'Live tracking is available only to the report owner and assigned response team.'; });
+    return;
+  }
+  const photo = event.target.closest("[data-completion-photo], [data-report-photo]");
   if (photo) {
+    const src = photo.dataset.completionPhoto || photo.dataset.reportPhoto;
+    const caption = photo.dataset.completionCaption || photo.dataset.reportCaption;
+    const label = photo.dataset.reportPhoto ? "Report photo" : "Treatment completion photo";
     const dialog = document.createElement("div");
     dialog.className = "photo-lightbox";
-    dialog.innerHTML = `<div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="Treatment completion photo"><button class="photo-lightbox-close" type="button" aria-label="Close photo">×</button><img src="${photo.dataset.completionPhoto}" alt="${photo.dataset.completionCaption}"><p>${photo.dataset.completionCaption}</p></div>`;
+    dialog.innerHTML = `<div class="photo-lightbox-panel" role="dialog" aria-modal="true" aria-label="${label}"><button class="photo-lightbox-close" type="button" aria-label="Close photo">×</button><img src="${src}" alt="${caption}"><p>${caption}</p></div>`;
     dialog.addEventListener("click", (click) => { if (click.target === dialog || click.target.closest(".photo-lightbox-close")) dialog.remove(); });
     document.body.append(dialog); return;
   }

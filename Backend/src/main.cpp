@@ -854,18 +854,30 @@ int main(){
 
     std::string animal_type = body["animal_type"].s();
     std::string condition = body["condition"].s();
+    std::string animal_species = body.has("animal_species") ? std::string(body["animal_species"].s()) : "";
+    std::string animal_details = body.has("animal_details") ? std::string(body["animal_details"].s()) : "";
+    std::string condition_other = body.has("condition_other") ? std::string(body["condition_other"].s()) : "";
+    std::string authority_type = body.has("authority_type") ? std::string(body["authority_type"].s()) : "government";
     std::string city = body["city"].s();
     std::string state = body["state"].s();
     std::string pincode = body["pincode"].s();
     std::string location = body["location"].s();
     std::string description = body.has("description") ? std::string(body["description"].s()) : "";
     std::string report_photo = body.has("photo") ? std::string(body["photo"].s()) : "";
+    std::string latitude = body.has("latitude") ? std::string(body["latitude"].s()) : "";
+    std::string longitude = body.has("longitude") ? std::string(body["longitude"].s()) : "";
     int priority = body.has("priority") ? body["priority"].i() : 2;   // naya: body se priority lo
+    const std::unordered_set<std::string> allowedAuthorities = {"government", "ngo", "private_ngo", "community", "other"};
+    if (!allowedAuthorities.count(authority_type)) authority_type = "government";
+    if (condition == "Other / not listed" && !condition_other.empty()) condition = condition_other;
     if (animal_type.empty() || condition.empty() || city.empty() || state.empty() || pincode.empty() || location.empty()) {
         return crow::response(400, "Animal type, condition, city, state, PIN code, and location are required");
     }
     if (!report_photo.empty() && (report_photo.rfind("data:image/", 0) != 0 || report_photo.size() > 4 * 1024 * 1024)) {
         return crow::response(400, "Upload a valid image smaller than 3 MB");
+    }
+    if ((!latitude.empty() || !longitude.empty()) && (latitude.empty() || longitude.empty())) {
+        return crow::response(400, "Please set both map coordinates");
     }
 
     try{
@@ -881,9 +893,9 @@ int main(){
             area_id = area[0]["area_id"].as<int>();
         }
         pqxx::result r1 = txn.exec_params(
-            "INSERT INTO report (animal_type, condition, area_id, user_id, city, state, pincode, location, description, report_photo) "
-            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING report_id",
-            animal_type, condition, area_id, token.user_id, city, state, pincode, location, description, report_photo
+            "INSERT INTO report (animal_type, animal_species, animal_details, condition, condition_other, authority_type, area_id, user_id, city, state, pincode, location, description, report_photo, latitude, longitude) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULLIF($15, '')::double precision,NULLIF($16, '')::double precision) RETURNING report_id",
+            animal_type, animal_species, animal_details, condition, condition_other, authority_type, area_id, token.user_id, city, state, pincode, location, description, report_photo, latitude, longitude
         );
         int report_id = r1[0][0].as<int>();
 
@@ -1182,6 +1194,46 @@ int main(){
         }
     });
 
+    CROW_ROUTE(app, "/moderator/location").methods(crow::HTTPMethod::POST)([](const crow::request& req) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"moderator", "admin"}, authResponse)) return authResponse;
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("latitude") || !body.has("longitude")) return crow::response(400, "Latitude and longitude are required");
+        try {
+            double latitude = std::stod(body["latitude"].s());
+            double longitude = std::stod(body["longitude"].s());
+            if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return crow::response(400, "Invalid coordinates");
+            TokenData token = verifyToken(req.get_header_value("Authorization"));
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            txn.exec_params("INSERT INTO moderator_location (user_id, latitude, longitude, updated_at) VALUES ($1,$2,$3,NOW()) "
+                            "ON CONFLICT (user_id) DO UPDATE SET latitude = EXCLUDED.latitude, longitude = EXCLUDED.longitude, updated_at = NOW()",
+                            token.user_id, latitude, longitude);
+            txn.commit();
+            crow::json::wvalue response; response["message"] = "Live location updated"; return crow::response(200, response);
+        } catch (const std::exception& e) { crow::json::wvalue error; error["error"] = e.what(); return crow::response(400, error); }
+    });
+
+    CROW_ROUTE(app, "/reports/<int>/tracking")([](const crow::request& req, int report_id) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"citizen", "moderator", "admin"}, authResponse)) return authResponse;
+        TokenData token = verifyToken(req.get_header_value("Authorization"));
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result report = txn.exec_params("SELECT r.user_id, r.area_id, COALESCE(ac.status, 'pending') AS status FROM report r LEFT JOIN animal_case ac ON ac.report_id = r.report_id WHERE r.report_id = $1", report_id);
+            if (report.empty()) return crow::response(404, "Report not found");
+            if (token.role == "citizen" && report[0]["user_id"].as<int>() != token.user_id) return crow::response(403, "You can only track your own reports");
+            pqxx::result location = txn.exec_params("SELECT ml.latitude, ml.longitude, ml.updated_at, u.name FROM moderator_location ml JOIN moderator m ON m.user_id = ml.user_id JOIN app_user u ON u.user_id = ml.user_id WHERE m.area_id = $1 ORDER BY ml.updated_at DESC LIMIT 1", report[0]["area_id"].as<int>());
+            txn.commit();
+            crow::json::wvalue response;
+            response["case_status"] = report[0]["status"].c_str();
+            response["available"] = !location.empty();
+            if (!location.empty()) { response["latitude"] = location[0]["latitude"].as<double>(); response["longitude"] = location[0]["longitude"].as<double>(); response["updated_at"] = location[0]["updated_at"].c_str(); response["moderator_name"] = location[0]["name"].c_str(); }
+            return crow::response(200, response);
+        } catch (const std::exception& e) { crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error); }
+    });
+
     CROW_ROUTE(app, "/dashboard")([](const crow::request& req) {
         crow::response authResponse;
         if (!isAuthorized(req, {"citizen", "moderator", "admin"}, authResponse)) return authResponse;
@@ -1195,9 +1247,11 @@ int main(){
             if (profile.empty()) return crow::response(404, "User not found");
 
             const std::string reportFields =
-                "r.report_id, r.animal_type, COALESCE(r.condition, 'Not specified') AS condition, "
+                "r.report_id, r.animal_type, COALESCE(r.animal_species, '') AS animal_species, COALESCE(r.animal_details, '') AS animal_details, "
+                "COALESCE(r.condition, 'Not specified') AS condition, COALESCE(r.authority_type, 'government') AS authority_type, "
                 "COALESCE(a.area_name, 'Unassigned') AS area_name, COALESCE(r.city, '') AS city, "
                 "COALESCE(r.state, '') AS state, COALESCE(r.pincode, '') AS pincode, "
+                "COALESCE(r.latitude, 0) AS latitude, COALESCE(r.longitude, 0) AS longitude, "
                 "COALESCE(r.location, '') AS location, COALESCE(r.description, '') AS description, COALESCE(r.report_photo, '') AS report_photo, "
                 "COALESCE(r.completion_photo, '') AS completion_photo, r.created_at, "
                 "COALESCE(ac.case_id, 0) AS case_id, COALESCE(ac.status, 'pending') AS status, "
@@ -1207,7 +1261,7 @@ int main(){
                 "LEFT JOIN animal_case ac ON ac.report_id = r.report_id ";
 
             pqxx::result community = txn.exec(
-                "SELECT " + reportFields + reportJoins + "ORDER BY r.created_at DESC LIMIT 12");
+                "SELECT " + reportFields + reportJoins + "WHERE COALESCE(r.authority_type, 'government') = 'community' ORDER BY r.created_at DESC LIMIT 12");
             pqxx::result personal;
             pqxx::result assigned;
             pqxx::result counters;
@@ -1246,11 +1300,16 @@ int main(){
                 for (const auto& row : reports) {
                     target[index]["report_id"] = row["report_id"].as<int>();
                     target[index]["animal_type"] = row["animal_type"].c_str();
+                    target[index]["animal_species"] = row["animal_species"].c_str();
+                    target[index]["animal_details"] = row["animal_details"].c_str();
                     target[index]["condition"] = row["condition"].c_str();
+                    target[index]["authority_type"] = row["authority_type"].c_str();
                     target[index]["area"] = row["area_name"].c_str();
                     target[index]["city"] = row["city"].c_str();
                     target[index]["state"] = row["state"].c_str();
                     target[index]["pincode"] = row["pincode"].c_str();
+                    target[index]["latitude"] = row["latitude"].as<double>();
+                    target[index]["longitude"] = row["longitude"].as<double>();
                     target[index]["location"] = row["location"].c_str();
                     target[index]["description"] = row["description"].c_str();
                     target[index]["report_photo"] = row["report_photo"].c_str();
