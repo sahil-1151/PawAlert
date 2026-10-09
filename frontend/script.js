@@ -6,6 +6,7 @@ function updateNavigation() {
   if (!user) return;
   document.querySelectorAll(".site-header nav").forEach((nav) => {
     nav.querySelectorAll('a[href="login.html"], a[href="signup.html"]').forEach((link) => link.remove());
+    if (user.role === "moderator" || user.role === "admin") nav.querySelectorAll('a[href="report.html"]').forEach((link) => link.remove());
     if (!nav.querySelector('[data-community-link], a[href="community.html"]')) {
       const community = document.createElement("a");
       community.href = "community.html";
@@ -24,12 +25,9 @@ function updateNavigation() {
     profile.title = "Open account menu";
     profile.setAttribute("aria-label", "Open account menu");
     profile.textContent = (user.name || "P").charAt(0).toUpperCase();
-    if (!nav.querySelector(".account-menu")) {
-      const menu = document.createElement("div");
-      menu.className = "account-menu";
-      menu.innerHTML = `<strong>${escapeHtml(user.name || "PawAlert user")}</strong><span>${escapeHtml(user.email || "")}</span><small>${escapeHtml(labelForRole(user.role || "citizen"))}</small><a href="dashboard.html">Dashboard</a><button type="button" data-logout>Log out</button>`;
-      nav.append(menu);
-    }
+    let menu = nav.querySelector(".account-menu");
+    if (!menu) { menu = document.createElement("div"); menu.className = "account-menu"; nav.append(menu); }
+    menu.innerHTML = `<strong>${escapeHtml(user.name || "PawAlert user")}</strong><span>${escapeHtml(user.email || "")}</span><small>${escapeHtml(labelForRole(user.role || "citizen"))}</small><a href="dashboard.html">Dashboard</a><button type="button" data-logout>Log out</button>`;
   });
 }
 
@@ -111,14 +109,49 @@ if (authoritySelect) {
   };
   authoritySelect.addEventListener("change", () => { authorityNote.textContent = authorityMessages[authoritySelect.value]; });
 }
+const speciesInput = document.querySelector('[name="animal_species"]');
+if (speciesInput) {
+  const breedList = document.createElement('datalist'); breedList.id = 'breed-suggestions'; document.body.append(breedList);
+  speciesInput.setAttribute('list', breedList.id); speciesInput.setAttribute('autocomplete', 'off');
+  let breedTimer;
+  speciesInput.addEventListener('input', () => {
+    clearTimeout(breedTimer); const query = speciesInput.value.trim(); if (query.length < 2) { breedList.innerHTML = ''; return; }
+    breedTimer = setTimeout(async () => { try {
+      const animal = document.querySelector('[name="animal_type"]')?.value || '';
+      const response = await request(`/animal-breeds?q=${encodeURIComponent(query)}&animal=${encodeURIComponent(animal)}`);
+      const breeds = Array.isArray(response) ? response : Object.values(response || {});
+      breedList.innerHTML = breeds.map((breed) => `<option value="${escapeHtml(breed.name)}"></option>`).join('');
+    } catch (_) { breedList.innerHTML = ''; } }, 180);
+  });
+}
 let reportMap;
 let reportPin;
+let mapLookupController;
+async function updateAddressFromPin(latitude, longitude) {
+  const mapStatus = document.querySelector("#map-status");
+  if (!mapStatus) return;
+  if (mapLookupController) mapLookupController.abort();
+  mapLookupController = new AbortController();
+  mapStatus.textContent = "Pin selected. Finding the nearby address…";
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}&zoom=18&addressdetails=1`;
+    const response = await fetch(url, { signal: mapLookupController.signal });
+    if (!response.ok) throw new Error("Address lookup failed");
+    const data = await response.json(); const address = data.address || {};
+    const fill = (name, value) => { const field = document.querySelector(`[name="${name}"]`); if (field && value) field.value = value; };
+    fill("city", address.city || address.town || address.village || address.county);
+    fill("state", address.state);
+    fill("pincode", address.postcode);
+    fill("location", data.display_name);
+    mapStatus.textContent = "Address updated from your pin. You can still edit any field below.";
+  } catch (error) { if (error.name !== "AbortError") mapStatus.textContent = "Pin saved. Enter the address manually if the lookup does not finish."; }
+}
 function setReportPin(latitude, longitude, zoom = true) {
   const lat = Number(latitude); const lng = Number(longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
   document.querySelector('[name="latitude"]').value = lat.toFixed(6);
   document.querySelector('[name="longitude"]').value = lng.toFixed(6);
-  document.querySelector("#map-status").textContent = `Pin selected: ${lat.toFixed(6)}, ${lng.toFixed(6)}. You can drag it to refine the point.`;
+  updateAddressFromPin(lat, lng);
   if (!reportMap) return;
   if (!reportPin) reportPin = L.marker([lat, lng], { draggable: true }).addTo(reportMap);
   else reportPin.setLatLng([lat, lng]);
@@ -195,6 +228,7 @@ document.querySelectorAll("form[data-api]").forEach((form) => form.addEventListe
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[c]));
 const labelForRole = (role) => ({ citizen: "Citizen", moderator: "Moderator", admin: "Administrator" }[role] || role);
 updateNavigation();
+if (document.querySelector('form[data-api="report"]') && ["moderator", "admin"].includes(currentUser()?.role)) location.replace("dashboard.html");
 function reportCards(reports, emptyText, canUpload = false) {
   if (!reports?.length) return `<p class="empty-state">${emptyText}</p>`;
   return reports.map((r) => `<article class="report-card"><div>${r.report_photo ? `<button class="report-photo-button" type="button" data-report-photo="${escapeHtml(r.report_photo)}" data-report-caption="Report photo · ${escapeHtml(r.animal_type)}"><img class="report-photo-thumb" src="${escapeHtml(r.report_photo)}" alt="Photo submitted for report #${escapeHtml(r.report_id)}" loading="lazy" decoding="async"><span>View report pics</span></button>` : ""}<h3>${escapeHtml(r.animal_type)}${r.animal_species ? ` <small>· ${escapeHtml(r.animal_species)}</small>` : ""}</h3><p>${escapeHtml(r.condition)} · ${escapeHtml(r.location || r.area)}, ${escapeHtml(r.city || r.area)}</p>${r.authority_type === "community" ? '<span class="community-label">Community report</span>' : ""}${r.completion_photo ? `<button class="completion-photo-button" type="button" data-completion-photo="${escapeHtml(r.completion_photo)}" data-completion-caption="Treatment completed · ${escapeHtml(r.animal_type)}"><img class="completion-photo" src="${escapeHtml(r.completion_photo)}" alt="Animal after treatment for report #${escapeHtml(r.report_id)}" loading="lazy" decoding="async"><span>View treatment photo</span></button>` : ""}${r.status === "completed" && !r.completion_photo ? `<p class="photo-pending">${canUpload ? "Add a post-treatment photo below." : "Treatment completed · photo update awaited from the rescue team."}</p>` : ""}${canUpload && r.status === "completed" && !r.completion_photo ? `<label class="completion-upload">Add treatment photo<input type="file" accept="image/jpeg,image/png,image/webp" data-completion-upload="${escapeHtml(r.report_id)}"></label>` : ""}</div><div class="report-meta"><strong>#${escapeHtml(r.report_id)}</strong><button class="status status-${escapeHtml(r.status).toLowerCase()} status-button" type="button" data-case-status="${escapeHtml(r.status)}" data-report-id="${escapeHtml(r.report_id)}" aria-label="View progress for report ${escapeHtml(r.report_id)}">${escapeHtml(r.status).replaceAll("_", " ")}</button><time>${new Date(r.created_at).toLocaleDateString()}</time></div></article>`).join("");
@@ -211,11 +245,12 @@ async function loadDashboard() {
   container.innerHTML = dashboardSkeleton(showWelcomeCat);
   await afterNextPaint();
   try {
-    const data = await getDashboardData(showWelcomeCat); const citizen = data.profile.role === "citizen"; const focusTitle = citizen ? "My reports" : data.profile.role === "moderator" ? "Reports in my area" : "All reports"; const focusReports = Array.isArray(citizen ? data.my_reports : data.managed_reports) ? (citizen ? data.my_reports : data.managed_reports) : []; const communityReports = Array.isArray(data.community_reports) ? data.community_reports : [];
+    const data = await getDashboardData(showWelcomeCat); const savedUser = currentUser(); localStorage.setItem("pawalert_user", JSON.stringify({ ...savedUser, name: data.profile.name, email: data.profile.email, role: data.profile.role })); updateNavigation(); container.dataset.role = data.profile.role; const citizen = data.profile.role === "citizen"; const moderator = data.profile.role === "moderator"; const focusTitle = citizen ? "My reports" : moderator ? "My active cases" : "All reports"; const focusReports = Array.isArray(citizen ? data.my_reports : data.managed_reports) ? (citizen ? data.my_reports : data.managed_reports) : []; const availableReports = moderator && Array.isArray(data.available_reports) ? data.available_reports : []; const communityReports = Array.isArray(data.community_reports) ? data.community_reports : [];
     const canUpload = ["moderator", "admin"].includes(data.profile.role);
-    container.innerHTML = `<section class="dashboard-hero"><div><p class="eyebrow"><span></span> ${labelForRole(data.profile.role)} dashboard</p><h1>Welcome, ${escapeHtml(data.profile.name)}.</h1><p>Keep up with the cases and people who need your attention.</p></div><aside class="profile-card"><div class="profile-avatar">${escapeHtml(data.profile.name.charAt(0).toUpperCase())}</div><div><strong>${escapeHtml(data.profile.name)}</strong><span>${escapeHtml(data.profile.email)}</span><small>${labelForRole(data.profile.role)}</small></div></aside></section><section class="dashboard-stats"><article><span>${citizen ? "Reports submitted" : "Cases in view"}</span><strong>${data.stats.total_cases}</strong></article><article><span>Pending attention</span><strong>${data.stats.pending_cases}</strong></article><article><span>Community updates</span><strong>${communityReports.length}</strong></article></section><section class="dashboard-section"><div class="section-title"><div><p class="eyebrow"><span></span> Your workspace</p><h2>${focusTitle}</h2></div>${citizen ? '<a class="button button-primary" href="report.html">Make a report <span>→</span></a>' : ""}</div><div class="report-grid">${reportCards(focusReports, "No reports are available yet.", canUpload)}</div></section>`;
+    container.innerHTML = `<section class="dashboard-hero"><div><p class="eyebrow"><span></span> ${labelForRole(data.profile.role)} dashboard</p><h1>Welcome, ${escapeHtml(data.profile.name)}.</h1><p>Keep up with the cases and people who need your attention.</p></div><aside class="profile-card"><div class="profile-avatar">${escapeHtml(data.profile.name.charAt(0).toUpperCase())}</div><div><strong>${escapeHtml(data.profile.name)}</strong><span>${escapeHtml(data.profile.email)}</span><small>${labelForRole(data.profile.role)}</small></div></aside></section><section class="dashboard-stats"><article><span>${citizen ? "Reports submitted" : "Cases in view"}</span><strong>${data.stats.total_cases}</strong></article><article><span>Pending attention</span><strong>${data.stats.pending_cases}</strong></article><article><span>Community updates</span><strong>${communityReports.length}</strong></article></section><section class="dashboard-section"><div class="section-title"><div><p class="eyebrow"><span></span> Your workspace</p><h2>${focusTitle}</h2></div>${citizen ? '<a class="button button-primary" href="report.html">Make a report <span>→</span></a>' : ""}</div><div class="report-grid">${reportCards(focusReports, "No reports are available yet.", canUpload)}</div></section>${moderator ? `<section class="dashboard-section"><div class="section-title"><div><p class="eyebrow"><span></span> Local response queue</p><h2>Available cases in your area</h2><p>Accept a case to add it to your active workspace and open directions.</p></div></div><div class="report-grid">${reportCards(availableReports, "No unassigned reports need a responder in your area.", false)}</div></section>` : ""}`;
     attachCompletionUploads(container);
     attachModeratorLocationControl(container, data.profile.role);
+    attachModeratorCaseActions(container, [...focusReports, ...availableReports], data.profile);
   } catch (error) { container.innerHTML = `<section class="dashboard-error"><h1>Dashboard unavailable</h1><p>${escapeHtml(error.message)}</p><a class="button button-primary" href="login.html">Log in again</a></section>`; }
 }
 async function loadCommunity() {
@@ -226,17 +261,19 @@ async function loadCommunity() {
   try {
     const data = await getDashboardData();
     const reports = Array.isArray(data.community_reports) ? data.community_reports : [];
-    const urgentCount = reports.filter((report) => report.priority === "urgent").length;
-    const pendingCount = reports.filter((report) => report.status === "pending").length;
+    const verifiedCount = reports.filter((report) => report.status === "verified").length;
+    const activeCount = reports.filter((report) => report.status === "in_progress").length;
     const canUpload = ["moderator", "admin"].includes(data.profile.role);
-    container.innerHTML = `<section class="community-page-heading"><p class="eyebrow"><span></span> PawAlert community</p><h1>Reports that need local care.</h1><p>See recent animal-welfare reports from across the PawAlert community.</p></section><section class="community-insights"><article><span>Recent reports</span><strong>${reports.length}</strong></article><article><span>Urgent attention</span><strong>${urgentCount}</strong></article><article><span>Pending updates</span><strong>${pendingCount}</strong></article></section><section class="dashboard-section community-section"><div class="community-toolbar"><div class="community-filters" aria-label="Filter community reports"><button class="active" data-community-filter="all">All reports</button><button data-community-filter="urgent">Urgent</button><button data-community-filter="pending">Pending</button></div></div><div class="report-grid" data-community-results>${reportCards(reports, "No reports are available yet.", canUpload)}</div></section><section class="community-guide"><div><p class="eyebrow"><span></span> Help safely</p><h2>What to do while help is on the way</h2></div><div class="guide-cards"><article><strong>01</strong><h3>Keep a safe distance</h3><p>Do not approach a frightened or injured animal suddenly. Keep people and traffic away when possible.</p></article><article><strong>02</strong><h3>Share clear details</h3><p>Add a landmark, condition, and location so a nearby moderator can respond without delay.</p></article><article><strong>03</strong><h3>Do not give medicine</h3><p>Offer water only if safe. Wait for trained rescue support before attempting treatment or transport.</p></article></div></section>`;
+    container.innerHTML = `<section class="community-page-heading"><p class="eyebrow"><span></span> PawAlert community</p><h1>Confirmed local reports.</h1><p>Verified and active cases in your area. Pending reports remain private until a moderator confirms them.</p></section><section class="community-insights"><article><span>Confirmed reports</span><strong>${reports.length}</strong></article><article><span>Verified</span><strong>${verifiedCount}</strong></article><article><span>Rescue in progress</span><strong>${activeCount}</strong></article></section><section class="dashboard-section community-section"><div class="community-toolbar"><div class="community-filters" aria-label="Filter community reports"><button class="active" data-community-filter="all">All</button><button data-community-filter="verified">Verified</button><button data-community-filter="in_progress">In progress</button><button data-community-filter="completed">Completed</button></div></div><div class="report-grid" data-community-results>${reportCards(reports, "No confirmed reports are available in your area.", canUpload)}</div></section><section class="community-guide"><div><p class="eyebrow"><span></span> Help safely</p><h2>What to do while help is on the way</h2></div><div class="guide-cards"><article><strong>01</strong><h3>Keep a safe distance</h3><p>Do not approach a frightened or injured animal suddenly. Keep people and traffic away when possible.</p></article><article><strong>02</strong><h3>Share clear details</h3><p>Add a landmark, condition, and location so a nearby moderator can respond without delay.</p></article><article><strong>03</strong><h3>Do not give medicine</h3><p>Offer water only if safe. Wait for trained rescue support before attempting treatment or transport.</p></article></div></section>`;
     const results = container.querySelector("[data-community-results]");
+    attachModeratorCaseActions(container, reports, data.profile);
     container.querySelectorAll("[data-community-filter]").forEach((button) => button.addEventListener("click", () => {
       const filter = button.dataset.communityFilter;
-      const filtered = filter === "all" ? reports : reports.filter((report) => filter === "urgent" ? report.priority === "urgent" : report.status === "pending");
+      const filtered = filter === "all" ? reports : reports.filter((report) => report.status === filter);
       container.querySelectorAll("[data-community-filter]").forEach((item) => item.classList.toggle("active", item === button));
       results.innerHTML = reportCards(filtered, `No ${filter} community reports right now.`, canUpload);
       attachCompletionUploads(container);
+      attachModeratorCaseActions(container, filtered, data.profile);
     }));
   } catch (error) { container.innerHTML = `<section class="dashboard-error"><h1>Community unavailable</h1><p>${escapeHtml(error.message)}</p></section>`; }
 }
@@ -252,7 +289,66 @@ function attachCompletionUploads(container) {
     reader.readAsDataURL(file);
   }));
 }
+function attachModeratorCaseActions(container, reports, profile) {
+  if (!['moderator', 'admin'].includes(profile.role)) return;
+  container.querySelectorAll('.report-card').forEach((card, index) => {
+    const report = reports[index]; if (!report || card.querySelector('[data-case-action]')) return;
+    const actions = document.createElement('div'); actions.className = 'case-actions';
+    if (!report.assigned_moderator_user_id && report.status !== 'completed') actions.innerHTML = `<button type="button" data-case-action="accept" data-case-report="${report.report_id}" data-case-animal="${escapeHtml(report.animal_type)}" data-case-latitude="${report.latitude || ''}" data-case-longitude="${report.longitude || ''}">${report.status === 'pending' ? 'Accept & verify' : 'Take over active case'}</button>`;
+    else if (report.assigned_moderator_user_id === profile.user_id || profile.role === 'admin') {
+      if (report.status === 'pending') actions.innerHTML = `<button type="button" data-case-action="directions" data-case-report="${report.report_id}" data-case-animal="${escapeHtml(report.animal_type)}" data-case-latitude="${report.latitude || ''}" data-case-longitude="${report.longitude || ''}">Open route</button><button type="button" data-case-action="verified" data-case-report="${report.report_id}">Verify on site & add comment</button>`;
+      else if (report.status === 'verified') actions.innerHTML = `<button type="button" data-case-action="in_progress" data-case-report="${report.report_id}">Start rescue & add update</button>`;
+      else if (report.status === 'in_progress') actions.innerHTML = `<button type="button" data-case-action="completed" data-case-report="${report.report_id}">Complete with note</button>`;
+    }
+    if (actions.innerHTML) card.firstElementChild.append(actions);
+  });
+}
 let moderatorLocationWatch;
+function pawAlertVanIcon() {
+  return window.L?.divIcon ? L.divIcon({ className: "pawalert-rescue-icon", html: '<div class="pawalert-rescue-marker" title="PawAlert rescue van">🚑<span>PawAlert</span></div>', iconSize: [58, 48], iconAnchor: [29, 41] }) : undefined;
+}
+async function snapToRoad(latitude, longitude) {
+  try {
+    const response = await fetch(`https://router.project-osrm.org/nearest/v1/driving/${longitude},${latitude}`);
+    const data = await response.json(); const point = data.waypoints?.[0]?.location;
+    if (Array.isArray(point) && point.length === 2) return [point[1], point[0]];
+  } catch (_) { /* Keep the device GPS point when road matching is unavailable. */ }
+  return [latitude, longitude];
+}
+function openModeratorDirections(destinationLatitude, destinationLongitude, reportId, animalName = "Animal") {
+  const latitude = Number(destinationLatitude), longitude = Number(destinationLongitude);
+  if (!window.L || !Number.isFinite(latitude) || !Number.isFinite(longitude) || (latitude === 0 && longitude === 0)) { alert('This report does not have a map pin yet.'); return; }
+  const dialog = document.createElement('div'); dialog.className = 'directions-modal';
+  dialog.innerHTML = `<div class="directions-panel" role="dialog" aria-modal="true" aria-label="Route to report"><button class="directions-close" type="button" aria-label="Close directions">×</button><p class="eyebrow"><span></span> PawAlert route</p><h2>${escapeHtml(animalName)}</h2><p data-directions-note>Finding route…</p><div class="directions-map"></div></div>`;
+  let routeWatch; let routeLine; let vanMarker; let lastRouteAt = 0; let positionVersion = 0;
+  const close = () => { if (routeWatch !== undefined) navigator.geolocation?.clearWatch(routeWatch); dialog.remove(); };
+  dialog.addEventListener('click', (event) => { if (event.target === dialog || event.target.closest('.directions-close')) close(); }); document.body.append(dialog);
+  const map = L.map(dialog.querySelector('.directions-map'), { zoomControl: false }).setView([latitude, longitude], 14);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '© OpenStreetMap contributors' }).addTo(map);
+  map.attributionControl.setPrefix(false);
+  L.marker([latitude, longitude]).addTo(map);
+  const note = dialog.querySelector('[data-directions-note]');
+  const updateRoute = async ({ coords }) => {
+    if (!document.body.contains(dialog)) return;
+    const version = ++positionVersion;
+    const start = await snapToRoad(coords.latitude, coords.longitude);
+    if (!document.body.contains(dialog) || version !== positionVersion) return;
+    if (!vanMarker) vanMarker = L.marker(start, { icon: pawAlertVanIcon() }).addTo(map);
+    else vanMarker.setLatLng(start);
+    map.setView(start, 17, { animate: true, duration: .75 });
+    post('/moderator/location', { latitude: String(start[0]), longitude: String(start[1]) }, true).catch(() => {});
+    if (Date.now() - lastRouteAt < 5000) return;
+    lastRouteAt = Date.now();
+    try {
+      const response = await fetch(`https://router.project-osrm.org/route/v1/driving/${start[1]},${start[0]};${longitude},${latitude}?overview=full&geometries=geojson`);
+      const data = await response.json(); const route = data.routes?.[0]; if (!route) throw new Error('No route');
+      if (routeLine) routeLine.remove(); routeLine = L.geoJSON(route.geometry, { style: { color: '#e85f6c', weight: 5, opacity: .88 } }).addTo(map);
+      note.textContent = `${(route.distance / 1000).toFixed(1)} km · ETA ${Math.ceil(route.duration / 60)} min`;
+    } catch (_) { note.textContent = 'Route unavailable'; }
+  };
+  navigator.geolocation?.getCurrentPosition(updateRoute, () => { note.textContent = 'Allow location access to draw your route. The destination pin is shown on the map.'; }, { enableHighAccuracy: true, timeout: 10000, maximumAge: 10000 });
+  routeWatch = navigator.geolocation?.watchPosition(updateRoute, () => {}, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+}
 function attachModeratorLocationControl(container, role) {
   if (!['moderator', 'admin'].includes(role) || container.querySelector('[data-share-location]')) return;
   const profile = container.querySelector('.profile-card'); if (!profile) return;
@@ -270,6 +366,19 @@ function attachModeratorLocationControl(container, role) {
   profile.append(control);
 }
 document.addEventListener("click", (event) => {
+  const caseAction = event.target.closest('[data-case-action]');
+  if (caseAction) {
+    const reportId = caseAction.dataset.caseReport; const action = caseAction.dataset.caseAction;
+    caseAction.disabled = true;
+    (async () => { try {
+      if (action === 'directions') { openModeratorDirections(caseAction.dataset.caseLatitude, caseAction.dataset.caseLongitude, reportId, caseAction.dataset.caseAnimal); caseAction.disabled = false; return; }
+      if (action === 'accept') { await post(`/reports/${reportId}/accept`, {}, true); openModeratorDirections(caseAction.dataset.caseLatitude, caseAction.dataset.caseLongitude, reportId, caseAction.dataset.caseAnimal); }
+      else { const label = action === 'verified' ? 'Add verification comment / suggestion for admin:' : action === 'completed' ? 'Add a completion note or suggestion:' : 'Add a responder update or suggestion:'; const note = prompt(label); if (note === null || (action === 'verified' && !note.trim())) { caseAction.disabled = false; return; } await request(`/reports/${reportId}/status`, { method: 'PATCH', body: { status: action, note }, authenticated: true }); }
+      clearDashboardCache();
+      if (action === 'accept') { caseAction.textContent = 'Accepted · open route above'; caseAction.disabled = true; return; }
+      location.reload();
+    } catch (error) { alert(error.message); caseAction.disabled = false; } })(); return;
+  }
   const statusButton = event.target.closest("[data-case-status]");
   if (statusButton) {
     const current = statusButton.dataset.caseStatus.toLowerCase().replaceAll("_", " ");
@@ -279,19 +388,30 @@ document.addEventListener("click", (event) => {
     const details = ["Your report has reached the PawAlert queue.", "A responder has reviewed the report details.", "A rescue team is working on the case.", "The case has been marked complete."];
     const dialog = document.createElement("div"); dialog.className = "progress-modal";
     dialog.innerHTML = `<div class="progress-panel" role="dialog" aria-modal="true" aria-label="Report progress"><button class="progress-close" type="button" aria-label="Close progress">×</button><p class="eyebrow"><span></span> Report #${escapeHtml(statusButton.dataset.reportId)}</p><h2>Case progress</h2><p class="progress-summary">Current status: <strong>${escapeHtml(current)}</strong></p><ol class="progress-timeline">${labels.map((label, index) => `<li class="${index < currentIndex ? "done" : index === currentIndex ? "current" : ""}"><span>${index < currentIndex ? "✓" : index + 1}</span><div><strong>${label}</strong><p>${details[index]}</p></div></li>`).join("")}</ol><section class="tracking-panel"><strong>Live responder location</strong><p data-tracking-note>Checking for a responder location…</p><div class="tracking-map" data-tracking-map hidden></div></section></div>`;
-    dialog.addEventListener("click", (click) => { if (click.target === dialog || click.target.closest(".progress-close")) dialog.remove(); });
+    let trackingTimer;
+    dialog.addEventListener("click", (click) => { if (click.target === dialog || click.target.closest(".progress-close")) { clearInterval(trackingTimer); dialog.remove(); } });
     document.body.append(dialog);
-    request(`/reports/${statusButton.dataset.reportId}/tracking`, { authenticated: true }).then((tracking) => {
+    let map; let responderMarker; let destinationMarker; let routeLine;
+    const rescueVanIcon = pawAlertVanIcon();
+    const refreshTracking = () => request(`/reports/${statusButton.dataset.reportId}/tracking`, { authenticated: true }).then((tracking) => {
       const note = dialog.querySelector('[data-tracking-note]');
       if (!tracking.available) { note.textContent = 'No responder has shared a live location yet.'; return; }
-      note.textContent = `${tracking.moderator_name} last shared a location at ${new Date(tracking.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`;
+      note.textContent = `${tracking.moderator_name}'s PawAlert rescue van is live · updated ${new Date(tracking.updated_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}.`;
       const mapElement = dialog.querySelector('[data-tracking-map]');
       if (!window.L) return;
       mapElement.hidden = false;
-      const map = L.map(mapElement, { zoomControl: false, attributionControl: false }).setView([tracking.latitude, tracking.longitude], 15);
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-      L.marker([tracking.latitude, tracking.longitude]).addTo(map).bindPopup('Responder location').openPopup();
+      const moderatorPoint = [tracking.latitude, tracking.longitude]; const destinationPoint = [tracking.destination_latitude, tracking.destination_longitude];
+      const hasDestination = Number.isFinite(destinationPoint[0]) && Number.isFinite(destinationPoint[1]) && !(destinationPoint[0] === 0 && destinationPoint[1] === 0);
+      if (!map) { map = L.map(mapElement, { zoomControl: false, attributionControl: false }).setView(moderatorPoint, 15); L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map); responderMarker = L.marker(moderatorPoint, { icon: rescueVanIcon }).addTo(map).bindPopup('PawAlert rescue van').openPopup(); }
+      else responderMarker.setLatLng(moderatorPoint);
+      if (!hasDestination) return;
+      if (!destinationMarker) destinationMarker = L.marker(destinationPoint).addTo(map).bindPopup('Your report location'); else destinationMarker.setLatLng(destinationPoint);
+      fetch(`https://router.project-osrm.org/route/v1/driving/${tracking.longitude},${tracking.latitude};${tracking.destination_longitude},${tracking.destination_latitude}?overview=full&geometries=geojson`).then((response) => response.json()).then((routeData) => {
+        const route = routeData.routes?.[0]; if (!route) throw new Error('No route'); if (routeLine) routeLine.remove(); routeLine = L.geoJSON(route.geometry, { style: { color: '#e85f6c', weight: 4 } }).addTo(map); map.fitBounds(routeLine.getBounds(), { padding: [22, 22], maxZoom: 15 }); note.textContent = `${tracking.moderator_name}'s PawAlert rescue van is ${(route.distance / 1000).toFixed(1)} km away · about ${Math.ceil(route.duration / 60)} min by road. Live updates are on while this window is open.`;
+      }).catch(() => { map.fitBounds(L.latLngBounds([moderatorPoint, destinationPoint]), { padding: [22, 22] }); });
     }).catch(() => { const note = dialog.querySelector('[data-tracking-note]'); note.textContent = 'Live tracking is available only to the report owner and assigned response team.'; });
+    refreshTracking();
+    trackingTimer = setInterval(() => { if (document.body.contains(dialog)) refreshTracking(); else clearInterval(trackingTimer); }, 7000);
     return;
   }
   const photo = event.target.closest("[data-completion-photo], [data-report-photo]");

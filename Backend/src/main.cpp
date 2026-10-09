@@ -821,6 +821,25 @@ int main(){
 
     });
 
+    CROW_ROUTE(app, "/animal-breeds")([](const crow::request& req) {
+        const char* queryValue = req.url_params.get("q");
+        const char* animalValue = req.url_params.get("animal");
+        std::string query = queryValue ? queryValue : "";
+        std::string animal = animalValue ? animalValue : "";
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result breeds = txn.exec_params(
+                "SELECT breed_name FROM animal_breed WHERE breed_name ILIKE $1 "
+                "AND ($2 = '' OR LOWER(animal_type) = LOWER($2)) ORDER BY breed_name LIMIT 8",
+                query + "%", animal);
+            txn.commit();
+            crow::json::wvalue response; int index = 0;
+            for (const auto& breed : breeds) response[index++]["name"] = breed["breed_name"].c_str();
+            return crow::response(200, response);
+        } catch (const std::exception& e) { crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error); }
+    });
+
     CROW_ROUTE(app,"/reports/<int>").methods(crow::HTTPMethod::DELETE)([](const crow::request& req,int report_id){
         crow::response res;
         if(!isAuthorized(req,{"admin"},res)){
@@ -1221,17 +1240,47 @@ int main(){
         try {
             pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
             pqxx::work txn(conn);
-            pqxx::result report = txn.exec_params("SELECT r.user_id, r.area_id, COALESCE(ac.status, 'pending') AS status FROM report r LEFT JOIN animal_case ac ON ac.report_id = r.report_id WHERE r.report_id = $1", report_id);
+            pqxx::result report = txn.exec_params("SELECT r.user_id, r.area_id, COALESCE(r.latitude, 0) AS latitude, COALESCE(r.longitude, 0) AS longitude, COALESCE(ac.status, 'pending') AS status, ac.assigned_moderator_user_id FROM report r LEFT JOIN animal_case ac ON ac.report_id = r.report_id WHERE r.report_id = $1", report_id);
             if (report.empty()) return crow::response(404, "Report not found");
             if (token.role == "citizen" && report[0]["user_id"].as<int>() != token.user_id) return crow::response(403, "You can only track your own reports");
-            pqxx::result location = txn.exec_params("SELECT ml.latitude, ml.longitude, ml.updated_at, u.name FROM moderator_location ml JOIN moderator m ON m.user_id = ml.user_id JOIN app_user u ON u.user_id = ml.user_id WHERE m.area_id = $1 ORDER BY ml.updated_at DESC LIMIT 1", report[0]["area_id"].as<int>());
+            pqxx::result location = txn.exec_params("SELECT ml.latitude, ml.longitude, ml.updated_at, u.name FROM moderator_location ml JOIN app_user u ON u.user_id = ml.user_id WHERE ml.user_id = $1", report[0]["assigned_moderator_user_id"].as<int>(0));
             txn.commit();
             crow::json::wvalue response;
             response["case_status"] = report[0]["status"].c_str();
+            response["destination_latitude"] = report[0]["latitude"].as<double>();
+            response["destination_longitude"] = report[0]["longitude"].as<double>();
             response["available"] = !location.empty();
             if (!location.empty()) { response["latitude"] = location[0]["latitude"].as<double>(); response["longitude"] = location[0]["longitude"].as<double>(); response["updated_at"] = location[0]["updated_at"].c_str(); response["moderator_name"] = location[0]["name"].c_str(); }
             return crow::response(200, response);
         } catch (const std::exception& e) { crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error); }
+    });
+
+    CROW_ROUTE(app, "/reports/<int>/accept").methods(crow::HTTPMethod::POST)([](const crow::request& req, int report_id) {
+        crow::response authResponse; if (!isAuthorized(req, {"moderator", "admin"}, authResponse)) return authResponse;
+        TokenData token = verifyToken(req.get_header_value("Authorization"));
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER"))); pqxx::work txn(conn);
+            pqxx::result updated;
+            if (token.role == "admin") updated = txn.exec_params("UPDATE animal_case SET assigned_moderator_user_id=$1, updated_at=NOW() WHERE report_id=$2 AND status <> 'completed' AND (assigned_moderator_user_id IS NULL OR assigned_moderator_user_id=$1) RETURNING case_id, status", token.user_id, report_id);
+            else updated = txn.exec_params("UPDATE animal_case ac SET assigned_moderator_user_id=$1, updated_at=NOW() FROM report r JOIN moderator m ON m.area_id=r.area_id WHERE ac.report_id=r.report_id AND r.report_id=$2 AND m.user_id=$1 AND ac.status <> 'completed' AND (ac.assigned_moderator_user_id IS NULL OR ac.assigned_moderator_user_id=$1) RETURNING ac.case_id, ac.status", token.user_id, report_id);
+            if (updated.empty()) return crow::response(409, "Completed cases cannot be accepted, or this active case is assigned to another responder");
+            txn.exec_params("INSERT INTO case_update(case_id, author_user_id, status, note) VALUES($1,$2,$3,'Moderator accepted the case and is travelling to inspect it')", updated[0]["case_id"].as<int>(), token.user_id, updated[0]["status"].c_str()); txn.commit();
+            crow::json::wvalue response; response["message"]="Report accepted. Verify it after reaching the location."; return crow::response(200,response);
+        } catch (const std::exception& e) { crow::json::wvalue error; error["error"]=e.what(); return crow::response(500,error); }
+    });
+
+    CROW_ROUTE(app, "/reports/<int>/status").methods(crow::HTTPMethod::PATCH)([](const crow::request& req, int report_id) {
+        crow::response authResponse; if (!isAuthorized(req, {"moderator", "admin"}, authResponse)) return authResponse;
+        auto body=crow::json::load(req.body); if(!body || !body.has("status")) return crow::response(400,"A status is required");
+        std::string status=body["status"].s(); std::string note=body.has("note")?std::string(body["note"].s()):"";
+        const std::unordered_set<std::string> allowed={"verified","in_progress","completed"}; if(!allowed.count(status)) return crow::response(400,"Invalid status");
+        if (status == "verified" && note.empty()) return crow::response(400, "Add a verification comment or suggestion for the admin");
+        TokenData token=verifyToken(req.get_header_value("Authorization"));
+        try { pqxx::connection conn("dbname=pawalert user="+std::string(getenv("USER"))); pqxx::work txn(conn);
+            pqxx::result updated=txn.exec_params("UPDATE animal_case SET status=$1, moderator_note=$2, updated_at=NOW() WHERE report_id=$3 AND (assigned_moderator_user_id=$4 OR $5='admin') RETURNING case_id",status,note,report_id,token.user_id,token.role);
+            if(updated.empty()) return crow::response(403,"Accept this report before posting updates");
+            txn.exec_params("INSERT INTO case_update(case_id, author_user_id, status, note) VALUES($1,$2,$3,$4)",updated[0]["case_id"].as<int>(),token.user_id,status,note); txn.commit(); crow::json::wvalue response; response["message"]="Case update saved"; return crow::response(200,response);
+        } catch(const std::exception& e){crow::json::wvalue error;error["error"]=e.what();return crow::response(500,error);}
     });
 
     CROW_ROUTE(app, "/dashboard")([](const crow::request& req) {
@@ -1255,32 +1304,51 @@ int main(){
                 "COALESCE(r.location, '') AS location, COALESCE(r.description, '') AS description, COALESCE(r.report_photo, '') AS report_photo, "
                 "COALESCE(r.completion_photo, '') AS completion_photo, r.created_at, "
                 "COALESCE(ac.case_id, 0) AS case_id, COALESCE(ac.status, 'pending') AS status, "
-                "COALESCE(ac.priority, 'routine') AS priority ";
+                "COALESCE(ac.priority, 'routine') AS priority, COALESCE(ac.assigned_moderator_user_id, 0) AS assigned_moderator_user_id, COALESCE(ac.moderator_note, '') AS moderator_note ";
             const std::string reportJoins =
                 " FROM report r LEFT JOIN area a ON r.area_id = a.area_id "
                 "LEFT JOIN animal_case ac ON ac.report_id = r.report_id ";
 
-            pqxx::result community = txn.exec(
-                "SELECT " + reportFields + reportJoins + "WHERE COALESCE(r.authority_type, 'government') = 'community' ORDER BY r.created_at DESC LIMIT 12");
+            const std::string communityOrder =
+                " ORDER BY CASE ac.status WHEN 'verified' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'completed' THEN 3 ELSE 4 END, r.created_at DESC LIMIT 50";
+            pqxx::result community;
             pqxx::result personal;
             pqxx::result assigned;
+            pqxx::result available;
             pqxx::result counters;
 
             if (token.role == "citizen") {
+                community = txn.exec_params(
+                    "SELECT " + reportFields + reportJoins +
+                    "WHERE ac.status IN ('verified','in_progress','completed') "
+                    "AND r.area_id IN (SELECT DISTINCT area_id FROM report WHERE user_id = $1 AND area_id IS NOT NULL)" + communityOrder,
+                    token.user_id);
                 personal = txn.exec_params(
                     "SELECT " + reportFields + reportJoins + "WHERE r.user_id = $1 ORDER BY r.created_at DESC", token.user_id);
                 counters = txn.exec_params(
                     "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE COALESCE(ac.status, 'pending') = 'pending') AS pending "
                     "FROM report r LEFT JOIN animal_case ac ON ac.report_id = r.report_id WHERE r.user_id = $1", token.user_id);
             } else if (token.role == "moderator") {
+                community = txn.exec_params(
+                    "SELECT " + reportFields + reportJoins +
+                    "JOIN moderator m ON m.area_id = r.area_id WHERE m.user_id = $1 "
+                    "AND ac.status IN ('verified','in_progress','completed')" + communityOrder,
+                    token.user_id);
                 assigned = txn.exec_params(
                     "SELECT " + reportFields + reportJoins +
-                    "JOIN moderator m ON m.area_id = r.area_id WHERE m.user_id = $1 ORDER BY r.created_at DESC", token.user_id);
+                    "JOIN moderator m ON m.area_id = r.area_id WHERE m.user_id = $1 AND ac.assigned_moderator_user_id = $1 AND ac.status <> 'completed' ORDER BY ac.updated_at DESC", token.user_id);
+                available = txn.exec_params(
+                    "SELECT " + reportFields + reportJoins +
+                    "JOIN moderator m ON m.area_id = r.area_id WHERE m.user_id = $1 "
+                    "AND ac.status = 'pending' AND ac.assigned_moderator_user_id IS NULL ORDER BY r.created_at DESC", token.user_id);
                 counters = txn.exec_params(
                     "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE ac.status = 'pending') AS pending "
                     "FROM animal_case ac JOIN report r ON ac.report_id = r.report_id "
                     "JOIN moderator m ON m.area_id = r.area_id WHERE m.user_id = $1", token.user_id);
             } else {
+                community = txn.exec(
+                    "SELECT " + reportFields + reportJoins +
+                    "WHERE ac.status IN ('verified','in_progress','completed')" + communityOrder);
                 assigned = txn.exec("SELECT " + reportFields + reportJoins + "ORDER BY r.created_at DESC");
                 counters = txn.exec(
                     "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE status = 'pending') AS pending FROM animal_case");
@@ -1318,12 +1386,15 @@ int main(){
                     target[index]["case_id"] = row["case_id"].as<int>();
                     target[index]["status"] = row["status"].c_str();
                     target[index]["priority"] = row["priority"].c_str();
+                    target[index]["assigned_moderator_user_id"] = row["assigned_moderator_user_id"].as<int>();
+                    target[index]["moderator_note"] = row["moderator_note"].c_str();
                     ++index;
                 }
             };
             addReports(response["community_reports"], community);
             if (token.role == "citizen") addReports(response["my_reports"], personal);
             else addReports(response["managed_reports"], assigned);
+            if (token.role == "moderator") addReports(response["available_reports"], available);
             return crow::response(200, response);
         } catch (const std::exception& e) {
             crow::json::wvalue error;
