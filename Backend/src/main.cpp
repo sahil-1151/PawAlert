@@ -94,7 +94,7 @@ std::string description;
 int priority; // priority goes up when number goes down.
 
 bool operator<(const Job& other) const {
-        return priority > other.priority;  // ULTA likha hai jaanbujh ke (neeche explain karunga)
+        return priority > other.priority; 
     }
 };
 std::priority_queue<Job> jobQueue; // what are the jobs do we have.
@@ -110,15 +110,13 @@ bool stopWorkers = false;
             queueCV.wait(lock, [] { return !jobQueue.empty() || stopWorkers; });
 
             if (stopWorkers && jobQueue.empty()) {
-                return;  // shutdown signal mila, aur kaam bhi khatam, ab thread band karo
+                return;  
             }
 
             job = jobQueue.top();
             jobQueue.pop();
         }
 
-        // Job process karo (abhi ke liye simple print, real system mein yahan
-        // actual notification bhejna ho sakta hai)
         std::cout << "[Worker " << worker_id << "] Processing case " << job.case_id 
                   << " (priority " << job.priority << "): " << job.description << std::endl;
         
@@ -166,7 +164,7 @@ int main(){
         std::cerr << "Could not initialize the email-service client." << std::endl;
         return 1;
     }
-    crow::App<crow::CORSHandler> app;  //this will create our server obj.
+    crow::App<crow::CORSHandler> app;                                                                        //this will create our server obj.
      auto& cors = app.get_middleware<crow::CORSHandler>();
     cors
         .global()
