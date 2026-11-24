@@ -1,0 +1,4 @@
+/Users/sahil/Desktop/PBL-5SEM/Backend/src/CMakeFiles/pawalert_server.dir
+/Users/sahil/Desktop/PBL-5SEM/Backend/src/CMakeFiles/run_tests.dir
+/Users/sahil/Desktop/PBL-5SEM/Backend/src/CMakeFiles/edit_cache.dir
+/Users/sahil/Desktop/PBL-5SEM/Backend/src/CMakeFiles/rebuild_cache.dir

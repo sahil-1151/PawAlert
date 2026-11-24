@@ -429,32 +429,32 @@ int main(){
 
         crow::response res;
         if(!isAuthorized(req, {"moderator","admin"}, res)) {
-        return res;
+            return res;
+        }
 
-            auto body = crow::json::load(req.body);
-            if(!body) return crow::response(400, "INVALID JSON");
-            bool available = body["available"].b();
-            try{
-                pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
-                pqxx::work txn(conn);
+        auto body = crow::json::load(req.body);
+        if(!body || !body.has("available")) return crow::response(400, "available is required");
+        bool available = body["available"].b();
+        try{
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
         
-                txn.exec_params(
+            txn.exec_params(
                 "UPDATE resource SET available = $1 WHERE resource_id = $2",
                 available, resource_id
-        );
-        txn.commit();
+            );
+            txn.commit();
 
-        crow::json::wvalue response;
-        response["resource_id"] = resource_id;
-        response["available"] = available;
-        return crow::response(200,response); 
-            }
+            crow::json::wvalue response;
+            response["resource_id"] = resource_id;
+            response["available"] = available;
+            return crow::response(200,response);
+        }
         catch(const std::exception& e){
             crow::json::wvalue error;
             error["error"] = e.what();
             return crow::response(500,error);
         } 
-        }
     });
     
     CROW_ROUTE(app,"/resources/<int>").methods(crow::HTTPMethod::DELETE)([](const crow::request& req,int resource_id){
@@ -923,6 +923,12 @@ int main(){
             report_id, priority_label
         );
         int case_id = r2[0][0].as<int>();
+        // Keep the in-memory OS queue backed by a recoverable dispatch record.
+        // The acknowledgement deadline is used by the escalation module.
+        txn.exec_params(
+            "INSERT INTO case_dispatch (case_id, priority) VALUES ($1, $2)",
+            case_id, priority
+        );
         txn.commit();
 
         {
@@ -975,7 +981,7 @@ int main(){
     
     CROW_ROUTE(app,"/case_status_history").methods(crow::HTTPMethod::POST)([](const crow::request& req){
         crow::response res;
-        if(!isAuthorized(req,{"admin","moderator"},res)){
+        if(!isAuthorized(req,{"admin", "moderator"},res)){
             return res;
         }
         auto body =crow::json::load(req.body);
@@ -1007,7 +1013,7 @@ int main(){
 
     CROW_ROUTE(app, "/notifications")([](const crow::request& req){
         crow::response res;
-        if(!isAuthorized(req,{"admin","moderator"},res)){
+        if(!isAuthorized(req,{"admin", "moderator"},res)){
             return res;
         }
         try{
@@ -1037,7 +1043,7 @@ int main(){
 
     CROW_ROUTE(app,"/notifications").methods(crow::HTTPMethod::POST)([](const crow::request& req){
         crow::response res;
-        if(!isAuthorized(req,{"admin","moderator"},res)){
+        if(!isAuthorized(req,{"admin", "moderator"},res)){
             return res;
         }
         auto body = crow::json::load(req.body);
@@ -1071,7 +1077,7 @@ int main(){
 
     CROW_ROUTE(app,"/actions")([](const crow::request& req){
         crow::response res;
-        if(!isAuthorized(req,{"admin","moderator"},res)){
+        if(!isAuthorized(req,{"admin", "moderator"},res)){
             return res;
         }
         try{
@@ -1229,6 +1235,176 @@ int main(){
             txn.commit();
             crow::json::wvalue response; response["message"] = "Live location updated"; return crow::response(200, response);
         } catch (const std::exception& e) { crow::json::wvalue error; error["error"] = e.what(); return crow::response(400, error); }
+    });
+
+    // A responder controls whether dispatch can offer them new cases and how much work they can carry.
+    CROW_ROUTE(app, "/moderator/availability").methods(crow::HTTPMethod::POST)([](const crow::request& req) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"moderator", "admin"}, authResponse)) return authResponse;
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("is_available")) return crow::response(400, "is_available is required");
+        bool isAvailable = body["is_available"].b();
+        int maxActiveCases = body.has("max_active_cases") ? body["max_active_cases"].i() : 3;
+        if (maxActiveCases < 1 || maxActiveCases > 25) return crow::response(400, "max_active_cases must be between 1 and 25");
+        TokenData token = verifyToken(req.get_header_value("Authorization"));
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            txn.exec_params(
+                "INSERT INTO responder_availability (user_id, is_available, max_active_cases, updated_at) VALUES ($1,$2,$3,NOW()) "
+                "ON CONFLICT (user_id) DO UPDATE SET is_available=EXCLUDED.is_available, max_active_cases=EXCLUDED.max_active_cases, updated_at=NOW()",
+                token.user_id, isAvailable, maxActiveCases);
+            txn.commit();
+            crow::json::wvalue response;
+            response["is_available"] = isAvailable;
+            response["max_active_cases"] = maxActiveCases;
+            response["message"] = isAvailable ? "You are available for dispatch" : "You are unavailable for dispatch";
+            return crow::response(200, response);
+        } catch (const std::exception& e) {
+            crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error);
+        }
+    });
+
+    // Administrators can inspect suitable responders before assigning an open case.
+    CROW_ROUTE(app, "/reports/<int>/dispatch-options")([](const crow::request& req, int report_id) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"admin"}, authResponse)) return authResponse;
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result candidates = txn.exec_params(
+                "SELECT u.user_id, u.name, COALESCE(ra.max_active_cases, 3) AS max_active_cases, "
+                "COUNT(ac_assigned.case_id) FILTER (WHERE ac_assigned.status <> 'completed') AS active_cases, "
+                "CASE WHEN r.latitude IS NULL OR r.longitude IS NULL OR ml.latitude IS NULL OR ml.longitude IS NULL THEN NULL "
+                "ELSE 6371 * ACOS(LEAST(1.0, GREATEST(-1.0, COS(RADIANS(r.latitude)) * COS(RADIANS(ml.latitude)) * COS(RADIANS(ml.longitude) - RADIANS(r.longitude)) + SIN(RADIANS(r.latitude)) * SIN(RADIANS(ml.latitude))))) END AS distance_km "
+                "FROM report r JOIN moderator m ON m.area_id=r.area_id JOIN app_user u ON u.user_id=m.user_id "
+                "LEFT JOIN responder_availability ra ON ra.user_id=u.user_id "
+                "LEFT JOIN moderator_location ml ON ml.user_id=u.user_id "
+                "LEFT JOIN animal_case ac_assigned ON ac_assigned.assigned_moderator_user_id=u.user_id "
+                "WHERE r.report_id=$1 AND COALESCE(ra.is_available, TRUE)=TRUE "
+                "GROUP BY u.user_id, u.name, ra.max_active_cases, r.latitude, r.longitude, ml.latitude, ml.longitude "
+                "HAVING COUNT(ac_assigned.case_id) FILTER (WHERE ac_assigned.status <> 'completed') < COALESCE(ra.max_active_cases, 3) "
+                "ORDER BY distance_km NULLS LAST, active_cases ASC, u.name",
+                report_id);
+            txn.commit();
+            crow::json::wvalue response;
+            int index = 0;
+            for (const auto& row : candidates) {
+                response["candidates"][index]["user_id"] = row["user_id"].as<int>();
+                response["candidates"][index]["name"] = row["name"].c_str();
+                response["candidates"][index]["active_cases"] = row["active_cases"].as<int>();
+                response["candidates"][index]["max_active_cases"] = row["max_active_cases"].as<int>();
+                if (!row["distance_km"].is_null()) response["candidates"][index]["distance_km"] = row["distance_km"].as<double>();
+                ++index;
+            }
+            response["report_id"] = report_id;
+            response["candidate_count"] = index;
+            return crow::response(200, response);
+        } catch (const std::exception& e) {
+            crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error);
+        }
+    });
+
+    // An explicit assignment gives every case an owner, rather than relying only on a responder self-accepting it.
+    CROW_ROUTE(app, "/reports/<int>/assign").methods(crow::HTTPMethod::POST)([](const crow::request& req, int report_id) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"admin"}, authResponse)) return authResponse;
+        auto body = crow::json::load(req.body);
+        if (!body || !body.has("moderator_user_id")) return crow::response(400, "moderator_user_id is required");
+        int moderatorUserId = body["moderator_user_id"].i();
+        TokenData token = verifyToken(req.get_header_value("Authorization"));
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result updated = txn.exec_params(
+                "UPDATE animal_case ac SET assigned_moderator_user_id=$1, updated_at=NOW() "
+                "FROM report r JOIN moderator m ON m.area_id=r.area_id AND m.user_id=$1 "
+                "JOIN responder_availability ra ON ra.user_id=m.user_id "
+                "WHERE ac.report_id=r.report_id AND r.report_id=$2 AND ac.status <> 'completed' AND ra.is_available=TRUE "
+                "AND (SELECT COUNT(*) FROM animal_case active WHERE active.assigned_moderator_user_id=$1 AND active.status <> 'completed') < ra.max_active_cases "
+                "RETURNING ac.case_id",
+                moderatorUserId, report_id);
+            if (updated.empty()) return crow::response(409, "Responder is unavailable, at capacity, outside this area, or the case is completed");
+            int caseId = updated[0]["case_id"].as<int>();
+            txn.exec_params("INSERT INTO case_dispatch (case_id,status,priority,assigned_at,updated_at) VALUES ($1,'assigned',2,NOW(),NOW()) "
+                            "ON CONFLICT (case_id) DO UPDATE SET status='assigned', assigned_at=NOW(), updated_at=NOW()", caseId);
+            txn.exec_params("INSERT INTO case_update(case_id, author_user_id, status, note) VALUES($1,$2,'pending','Case assigned by dispatcher')", caseId, token.user_id);
+            txn.commit();
+            crow::json::wvalue response;
+            response["case_id"] = caseId;
+            response["moderator_user_id"] = moderatorUserId;
+            response["message"] = "Case assigned to responder";
+            return crow::response(200, response);
+        } catch (const std::exception& e) {
+            crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error);
+        }
+    });
+
+    // Escalation keeps a missed acknowledgement visible and auditable instead of silently leaving a report pending.
+    CROW_ROUTE(app, "/reports/<int>/escalate").methods(crow::HTTPMethod::POST)([](const crow::request& req, int report_id) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"moderator", "admin"}, authResponse)) return authResponse;
+        auto body = crow::json::load(req.body);
+        std::string reason = body && body.has("reason") ? std::string(body["reason"].s()) : "No responder acknowledgement within SLA";
+        if (reason.empty() || reason.size() > 255) return crow::response(400, "reason must be between 1 and 255 characters");
+        TokenData token = verifyToken(req.get_header_value("Authorization"));
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            pqxx::result caseRow = txn.exec_params("SELECT case_id FROM animal_case WHERE report_id=$1 AND status <> 'completed'", report_id);
+            if (caseRow.empty()) return crow::response(404, "Open case not found");
+            int caseId = caseRow[0]["case_id"].as<int>();
+            txn.exec_params("INSERT INTO case_escalation(case_id,initiated_by_user_id,reason) VALUES($1,$2,$3)", caseId, token.user_id, reason);
+            txn.exec_params("UPDATE case_dispatch SET status='escalated', updated_at=NOW() WHERE case_id=$1", caseId);
+            txn.exec_params("INSERT INTO case_update(case_id,author_user_id,status,note) VALUES($1,$2,'pending',$3)", caseId, token.user_id, "Escalated: " + reason);
+            txn.commit();
+            crow::json::wvalue response; response["case_id"] = caseId; response["message"] = "Case escalated"; return crow::response(200, response);
+        } catch (const std::exception& e) {
+            crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error);
+        }
+    });
+
+    CROW_ROUTE(app, "/operations/analytics")([](const crow::request& req) {
+        crow::response authResponse;
+        if (!isAuthorized(req, {"moderator", "admin"}, authResponse)) return authResponse;
+        TokenData token = verifyToken(req.get_header_value("Authorization"));
+        try {
+            pqxx::connection conn("dbname=pawalert user=" + std::string(getenv("USER")));
+            pqxx::work txn(conn);
+            bool isAdmin = token.role == "admin";
+            pqxx::result summary = txn.exec_params(
+                "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE ac.status='pending') AS pending, "
+                "COUNT(*) FILTER (WHERE ac.assigned_moderator_user_id IS NULL AND ac.status <> 'completed') AS unassigned, "
+                "COUNT(*) FILTER (WHERE ac.priority='urgent' AND ac.status <> 'completed') AS urgent_open, "
+                "COUNT(*) FILTER (WHERE ac.status='completed') AS completed, "
+                "COUNT(*) FILTER (WHERE cd.acknowledgement_due_at < NOW() AND cd.status='queued') AS overdue "
+                "FROM animal_case ac JOIN report r ON r.report_id=ac.report_id LEFT JOIN case_dispatch cd ON cd.case_id=ac.case_id "
+                "WHERE $1 OR r.area_id IN (SELECT area_id FROM moderator WHERE user_id=$2)", isAdmin, token.user_id);
+            pqxx::result areaWise = txn.exec_params(
+                "SELECT a.area_name, COUNT(*) FILTER (WHERE ac.status <> 'completed') AS open_cases, "
+                "COUNT(*) FILTER (WHERE ac.assigned_moderator_user_id IS NULL AND ac.status <> 'completed') AS unassigned_cases "
+                "FROM animal_case ac JOIN report r ON r.report_id=ac.report_id JOIN area a ON a.area_id=r.area_id "
+                "WHERE $1 OR r.area_id IN (SELECT area_id FROM moderator WHERE user_id=$2) "
+                "GROUP BY a.area_name ORDER BY open_cases DESC, a.area_name", isAdmin, token.user_id);
+            txn.commit();
+            crow::json::wvalue response;
+            response["total_cases"] = summary[0]["total"].as<int>();
+            response["pending_cases"] = summary[0]["pending"].as<int>();
+            response["unassigned_cases"] = summary[0]["unassigned"].as<int>();
+            response["urgent_open_cases"] = summary[0]["urgent_open"].as<int>();
+            response["completed_cases"] = summary[0]["completed"].as<int>();
+            response["overdue_acknowledgements"] = summary[0]["overdue"].as<int>();
+            int index = 0;
+            for (const auto& row : areaWise) {
+                response["areas"][index]["area_name"] = row["area_name"].c_str();
+                response["areas"][index]["open_cases"] = row["open_cases"].as<int>();
+                response["areas"][index]["unassigned_cases"] = row["unassigned_cases"].as<int>();
+                ++index;
+            }
+            return crow::response(200, response);
+        } catch (const std::exception& e) {
+            crow::json::wvalue error; error["error"] = e.what(); return crow::response(500, error);
+        }
     });
 
     CROW_ROUTE(app, "/reports/<int>/tracking")([](const crow::request& req, int report_id) {
